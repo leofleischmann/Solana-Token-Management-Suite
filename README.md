@@ -2,7 +2,6 @@
 
 Eine Sammlung von Python-Tools mit grafischer Benutzeroberfläche (GUI) zur einfachen Erstellung, Verwaltung und Überwachung von SPL-Tokens im Solana Devnet. Dieses Projekt ist ideal für Entwickler, die eine visuelle Schnittstelle für Token-Tests und Whitelist-Management benötigen, ohne sich mit der Kommandozeile auseinandersetzen zu müssen.
 
-
 ## Features
 
 Dieses Projekt besteht aus drei Hauptkomponenten:
@@ -15,11 +14,16 @@ Dieses Projekt besteht aus drei Hauptkomponenten:
 - **Token-Erstellung**: Initialisiert einen neuen SPL-Token mit Freeze-Authority.
 - **Whitelist-Generierung**: Erstellt eine `whitelist.txt`-Datei, die alle generierten Wallets für den Monitor enthält.
 
+![app2](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/setup.png?raw=true)
+
 #### 2. Management-Tool (`app.py`)
 - **Token- & SOL-Transfers**: Senden Sie SOL und Ihre benutzerdefinierten SPL-Tokens einfach zwischen den erstellten Wallets.
 - **Minting & Burning**: Erhöhen (Mint) oder verringern (Burn) Sie den Gesamtvorrat Ihres Tokens.
 - **Kontoverwaltung**: Frieren (Freeze) und Tauen (Thaw) Sie Token-Konten direkt von der Benutzeroberfläche aus.
 - **Echtzeit-Übersicht**: Zeigt die SOL- und Token-Bilanzen aller Wallets an und aktualisiert diese automatisch.
+
+![app](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/app.png?raw=true)
+![app2](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/app2.png?raw=true)
 
 #### 3. Whitelist-Monitor (`whitelist.py`)
 - **Echtzeit-Überwachung**: Verbindet sich über WebSockets mit dem Solana-Cluster und überwacht Token-Transaktionen live.
@@ -27,12 +31,14 @@ Dieses Projekt besteht aus drei Hauptkomponenten:
 - **Automatische Sanktionen**: Friert bei einem Whitelist-Verstoß automatisch das Token-Konto des Empfängers ein. Optional kann auch das Konto des Senders eingefroren werden.
 - **Live-Dashboard**: Zeigt Statistiken wie die Anzahl der analysierten Transaktionen, erkannte Verstöße und ein Live-Aktivitätsprotokoll an.
 
+![app2](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/whitelist.png?raw=true)
+
 ## Installation
 
 1.  **Repository klonen:**
     ```bash
     git clone [https://github.com/leofleischmann/Solana-Token-Management-Suite.git](https://github.com/leofleischmann/Solana-Token-Management-Suite.git)
-    cd <ins Verzeichnis>
+    cd Solana-Token-Management-Suite
     ```
 
 2.  **Abhängigkeiten installieren:**
