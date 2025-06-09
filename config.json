@@ -1,0 +1,4 @@
+{
+  "rpc_url": "https://api.devnet.solana.com",
+  "wallet_folder": "devnet_wallets"
+}
