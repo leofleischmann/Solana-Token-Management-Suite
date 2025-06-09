@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # === setup_ui_improved.py: Verbesserte grafische Benutzeroberfläche für das Solana Setup-Skript ===
+# Version mit UI-Konfiguration für Pinata JWT und Bildvalidierung
 
 import customtkinter as ctk
 import tkinter as tk
@@ -25,6 +26,7 @@ try:
     from solders.pubkey import Pubkey
     from solders.system_program import CreateAccountParams, create_account, transfer as system_transfer, TransferParams as SystemTransferParams
     from solders.transaction import Transaction
+    from solders.instruction import Instruction, AccountMeta
     from solana.rpc.api import Client
     from solana.exceptions import SolanaRpcException
     from spl.token.instructions import (
@@ -34,21 +36,91 @@ try:
         initialize_mint, InitializeMintParams
     )
     from spl.token.constants import TOKEN_PROGRAM_ID
-except ImportError:
-    messagebox.showerror("Fehler", "Eine oder mehrere Solana-Bibliotheken fehlen. Bitte installieren Sie diese (z.B. mit `pip install solana solders spl-token`).")
+except ImportError as e:
+    messagebox.showerror("Fehler: Fehlende Bibliotheken", f"Eine oder mehrere Solana-Bibliotheken fehlen: {e}\n\nBitte installieren Sie diese mit:\npip install solana solders spl-token-py")
     sys.exit(1)
 
-# --- Metadaten-Bibliothek (Optional) ---
+# --- Borsh-Bibliothek für manuelle Instruktions-Erstellung ---
 try:
-    from mpl_token_metadata.instructions import create_metadata_account_v3, CreateMetadataAccountV3InstructionArgs
-    from mpl_token_metadata.accounts import Metadata
-    from mpl_token_metadata.types import DataV2
-    METADATA_LIB_AVAILABLE = True
+    from borsh_construct import CStruct, String, U8, U16, U64, Vec, Option, Bool, Enum
+    from construct import Bytes
 except ImportError:
-    METADATA_LIB_AVAILABLE = False
+    messagebox.showerror("Fehler: Fehlende Bibliothek", "Die 'borsh-construct' Bibliothek fehlt.\n\nBitte installieren Sie diese mit:\npip install borsh-construct")
+    sys.exit(1)
+
+# --- Requests-Bibliothek für API-Aufrufe (Pinata) ---
+try:
+    import requests
+except ImportError:
+    messagebox.showerror("Fehler: Fehlende Bibliothek", "Die 'requests' Bibliothek fehlt.\n\nBitte installieren Sie diese mit:\npip install requests")
+    sys.exit(1)
+
+# --- Pillow (PIL) Bibliothek für Bildverarbeitung ---
+try:
+    from PIL import Image
+except ImportError:
+    messagebox.showerror("Fehler: Fehlende Bibliothek", "Die 'Pillow' Bibliothek fehlt.\n\nBitte installieren Sie diese mit:\npip install Pillow")
+    sys.exit(1)
+
+
+# --- Hilfsfunktionen für Pinata ---
+
+def _upload_file_to_pinata(filepath: str, jwt: str, log_func) -> Optional[str]:
+    """Lädt eine beliebige Datei zu Pinata hoch und gibt die IPFS-URI zurück."""
+    log_func(f"   → Lade Datei hoch: {os.path.basename(filepath)}...", "info")
+    if not os.path.exists(filepath):
+        log_func(f"   ❌ Fehler: Datei nicht gefunden unter {filepath}", "error")
+        return None
+
+    headers = {"Authorization": f"Bearer {jwt}"}
+    
+    with open(filepath, 'rb') as f:
+        file_data = f.read()
+
+    try:
+        response = requests.post(
+            "https://api.pinata.cloud/pinning/pinFileToIPFS",
+            files={'file': (os.path.basename(filepath), file_data)},
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        ipfs_hash = response.json().get("IpfsHash")
+        if not ipfs_hash:
+            raise ValueError("Antwort von Pinata enthielt keinen IPFS-Hash.")
+        
+        uri = f"ipfs://{ipfs_hash}"
+        log_func(f"   ✅ Datei hochgeladen! URI: {uri}", "success")
+        return uri
+    except Exception as e:
+        log_func(f"   ❌ FEHLER beim Datei-Upload zu Pinata: {e}", "error")
+        return None
+
+def _upload_json_to_pinata(json_data: dict, filename: str, jwt: str, log_func) -> Optional[str]:
+    """Lädt ein JSON-Objekt zu Pinata hoch und gibt die IPFS-URI zurück."""
+    log_func(f"   → Lade JSON-Metadaten hoch: {filename}...", "info")
+    headers = {"Authorization": f"Bearer {jwt}"}
+    payload = {
+        'pinataOptions': {'cidVersion': 1},
+        'pinataMetadata': {'name': filename},
+        'pinataContent': json_data
+    }
+    try:
+        response = requests.post("https://api.pinata.cloud/pinning/pinJSONToIPFS", json=payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        ipfs_hash = response.json().get("IpfsHash")
+        if not ipfs_hash:
+            raise ValueError("Antwort von Pinata enthielt keinen IPFS-Hash.")
+        
+        uri = f"ipfs://{ipfs_hash}"
+        log_func(f"   ✅ JSON-Metadaten hochgeladen! URI: {uri}", "success")
+        return uri
+    except Exception as e:
+        log_func(f"   ❌ FEHLER beim JSON-Upload zu Pinata: {e}", "error")
+        return None
 
 # --- Hilfsfunktionen für Transaktionen ---
-def confirm_and_send_transaction(http_client: Client, instructions, signers: list[Keypair], label: str, log_func):
+def confirm_and_send_transaction(http_client: Client, instructions: List[Instruction], signers: list[Keypair], label: str, log_func):
     """Baut, sendet und bestätigt eine Transaktion mit UI-Feedback."""
     log_func(f"→ Sende Transaktion: '{label}'...", "info")
     try:
@@ -90,7 +162,9 @@ class SetupConfig:
         self.create_metadata = False
         self.token_name = ""
         self.token_symbol = ""
+        self.token_image_path = ""
         self.token_uri = ""
+        self.pinata_jwt = ""
         
     def validate(self) -> Tuple[bool, str]:
         """Validiert die Konfiguration"""
@@ -117,10 +191,12 @@ class SetupConfig:
         
         if self.create_metadata:
             if not self.token_name.strip():
-                return False, "Token-Name ist erforderlich für Metadaten."
+                return False, "Token-Name ist für Metadaten erforderlich."
             if not self.token_symbol.strip():
-                return False, "Token-Symbol ist erforderlich für Metadaten."
-        
+                return False, "Token-Symbol ist für Metadaten erforderlich."
+            if not self.pinata_jwt.strip():
+                return False, "Pinata JWT Token ist für Metadaten erforderlich."
+
         return True, ""
     
     def get_summary(self) -> List[str]:
@@ -143,6 +219,8 @@ class SetupConfig:
         
         if self.create_metadata:
             summary.append(f"Metadaten: {self.token_name} ({self.token_symbol})")
+            img_status = os.path.basename(self.token_image_path) if self.token_image_path else "Platzhalterbild"
+            summary.append(f"Token-Bild: {img_status}")
         else:
             summary.append("Metadaten: Keine")
         
@@ -155,7 +233,7 @@ class SetupUI(ctk.CTk):
         super().__init__()
         
         # --- UI-Konfiguration ---
-        self.title("Solana Environment Setup - Verbesserte Version")
+        self.title("Solana Environment Setup - Automatische Metadaten")
         self.geometry("1000x800")
         self.minsize(900, 700)
         
@@ -181,10 +259,7 @@ class SetupUI(ctk.CTk):
 
     def _create_widgets(self):
         """Erstellt die Hauptbenutzeroberfläche"""
-        # --- Header ---
         self._create_header()
-        
-        # --- Hauptinhalt mit Tabs ---
         self._create_main_content()
 
     def _create_header(self):
@@ -194,7 +269,6 @@ class SetupUI(ctk.CTk):
                          pady=DesignSystem.SPACING['md'], sticky="ew")
         header_frame.grid_columnconfigure(1, weight=1)
         
-        # Titel und Icon
         title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         title_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], 
                         pady=DesignSystem.SPACING['md'], sticky="w")
@@ -205,7 +279,6 @@ class SetupUI(ctk.CTk):
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(side="left")
         
-        # Status und Aktionen
         actions_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         actions_frame.grid(row=0, column=1, padx=DesignSystem.SPACING['md'], 
                           pady=DesignSystem.SPACING['md'], sticky="e")
@@ -217,7 +290,6 @@ class SetupUI(ctk.CTk):
         )
         self.connection_status.pack(side="top", anchor="e")
         
-        # Haupt-Setup-Button
         self.start_button = ctk.CTkButton(
             actions_frame, 
             text=f"{DesignSystem.ICONS['start']} Setup starten", 
@@ -234,14 +306,12 @@ class SetupUI(ctk.CTk):
         self.tab_view.grid(row=1, column=0, padx=DesignSystem.SPACING['md'], 
                           pady=(0, DesignSystem.SPACING['md']), sticky="nsew")
         
-        # Tabs hinzufügen
         self.tab_view.add("⚙️ Konfiguration")
         self.tab_view.add("📋 Vorschau")
         self.tab_view.add("📊 Fortschritt")
         self.tab_view.add("ℹ️ Info")
         
-        self.config_tab = self.tab_view.tab("⚙️ Konfiguration")
-        self._create_config_tab(self.config_tab)
+        self._create_config_tab(self.tab_view.tab("⚙️ Konfiguration"))
         self._create_preview_tab(self.tab_view.tab("📋 Vorschau"))
         self._create_progress_tab(self.tab_view.tab("📊 Fortschritt"))
         self._create_info_tab(self.tab_view.tab("ℹ️ Info"))
@@ -251,22 +321,15 @@ class SetupUI(ctk.CTk):
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=1)
         
-        # Platzhalter für "Setup existiert"-Nachricht
         self.existing_setup_frame = ctk.CTkFrame(tab, fg_color="transparent")
         
-        # Scrollbarer Bereich
         self.scroll_frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=DesignSystem.SPACING['md'], 
                                pady=DesignSystem.SPACING['md'])
         self.scroll_frame.grid_columnconfigure(0, weight=1)
         
-        # Wallet-Konfiguration
         self._create_wallet_config_section(self.scroll_frame)
-        
-        # Token-Konfiguration
         self._create_token_config_section(self.scroll_frame)
-        
-        # Metadaten-Konfiguration
         self._create_metadata_config_section(self.scroll_frame)
 
     def _create_wallet_config_section(self, parent):
@@ -275,7 +338,6 @@ class SetupUI(ctk.CTk):
         wallet_frame.grid(row=0, column=0, sticky="ew", pady=(0, DesignSystem.SPACING['lg']))
         wallet_frame.grid_columnconfigure(0, weight=1)
         
-        # Header
         ctk.CTkLabel(
             wallet_frame, 
             text=f"{DesignSystem.ICONS['wallet']} Wallet-Konfiguration", 
@@ -283,7 +345,6 @@ class SetupUI(ctk.CTk):
         ).grid(row=0, column=0, padx=DesignSystem.SPACING['md'], 
                pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
         
-        # Payer/Emittent
         payer_frame = ctk.CTkFrame(wallet_frame, fg_color="transparent")
         payer_frame.grid(row=1, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
         payer_frame.grid_columnconfigure(1, weight=1)
@@ -293,7 +354,6 @@ class SetupUI(ctk.CTk):
         self.payer_prefix_entry = ctk.CTkEntry(payer_frame, placeholder_text="Präfix (z.B. 'Leo')", width=150)
         self.payer_prefix_entry.bind("<KeyRelease>", self._on_config_change)
         
-        # Mint
         mint_frame = ctk.CTkFrame(wallet_frame, fg_color="transparent")
         mint_frame.grid(row=2, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
         mint_frame.grid_columnconfigure(1, weight=1)
@@ -303,7 +363,6 @@ class SetupUI(ctk.CTk):
         self.mint_prefix_entry = ctk.CTkEntry(mint_frame, placeholder_text="Präfix (z.B. 'Mint')", width=150)
         self.mint_prefix_entry.bind("<KeyRelease>", self._on_config_change)
 
-        # Testnutzer
         users_frame = ctk.CTkFrame(wallet_frame, fg_color="transparent")
         users_frame.grid(row=3, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['sm'], DesignSystem.SPACING['md']))
         users_frame.grid_columnconfigure(1, weight=1)
@@ -315,7 +374,6 @@ class SetupUI(ctk.CTk):
         self.test_user_label = ctk.CTkLabel(users_frame, text="3", width=30)
         self.test_user_label.grid(row=0, column=2, padx=(DesignSystem.SPACING['sm'], 0))
         
-        # Testnutzer Vanity
         user_vanity_frame = ctk.CTkFrame(wallet_frame, fg_color="transparent")
         user_vanity_frame.grid(row=4, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
         user_vanity_frame.grid_columnconfigure(1, weight=1)
@@ -331,7 +389,6 @@ class SetupUI(ctk.CTk):
         token_frame.grid(row=1, column=0, sticky="ew", pady=(0, DesignSystem.SPACING['lg']))
         token_frame.grid_columnconfigure(1, weight=1)
         
-        # Header
         ctk.CTkLabel(
             token_frame, 
             text=f"{DesignSystem.ICONS['token']} Token-Konfiguration", 
@@ -339,68 +396,67 @@ class SetupUI(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], 
                pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
         
-        # Initialer Vorrat
         ctk.CTkLabel(token_frame, text="Initialer Token-Vorrat:").grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.initial_mint_entry = ctk.CTkEntry(token_frame, placeholder_text="z.B. 1000000", width=200)
         self.initial_mint_entry.insert(0, "1000000")
         self.initial_mint_entry.grid(row=1, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.initial_mint_entry.bind("<KeyRelease>", self._on_config_change)
 
-        # SOL für Nutzer
         ctk.CTkLabel(token_frame, text="SOL-Finanzierung für Testnutzer:").grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.sol_for_users_entry = ctk.CTkEntry(token_frame, placeholder_text="z.B. 0.05", width=200)
         self.sol_for_users_entry.insert(0, "0.05")
         self.sol_for_users_entry.grid(row=2, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.sol_for_users_entry.bind("<KeyRelease>", self._on_config_change)
         
-        # Spacer
         ctk.CTkLabel(token_frame, text="").grid(row=3, column=0, pady=DesignSystem.SPACING['sm'])
 
     def _create_metadata_config_section(self, parent):
         """Erstellt die Metadaten-Konfigurationssektion"""
-        metadata_frame = ctk.CTkFrame(parent, corner_radius=DesignSystem.RADIUS['md'])
-        metadata_frame.grid(row=2, column=0, sticky="ew")
-        metadata_frame.grid_columnconfigure(1, weight=1)
+        self.metadata_frame = ctk.CTkFrame(parent, corner_radius=DesignSystem.RADIUS['md'])
+        self.metadata_frame.grid(row=2, column=0, sticky="ew")
+        self.metadata_frame.grid_columnconfigure(1, weight=1)
         
-        # Header
         ctk.CTkLabel(
-            metadata_frame, 
+            self.metadata_frame, 
             text=f"{DesignSystem.ICONS['info']} Token-Metadaten", 
             font=ctk.CTkFont(size=16, weight="bold")
         ).grid(row=0, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], 
                pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
         
-        # Metadaten aktivieren
-        self.metadata_check = ctk.CTkCheckBox(metadata_frame, text="Token-Metadaten erstellen", command=self._toggle_metadata)
+        self.metadata_check = ctk.CTkCheckBox(self.metadata_frame, text="Token-Metadaten erstellen (automatisch via Pinata)", command=self._toggle_metadata)
         self.metadata_check.grid(row=1, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-        if not METADATA_LIB_AVAILABLE:
-            self.metadata_check.configure(state="disabled", text="Token-Metadaten erstellen (mpl-token-metadata nicht gefunden)")
         
-        # Metadaten-Felder (versteckt)
-        self.token_name_entry = ctk.CTkEntry(metadata_frame, placeholder_text="Token Name (z.B. 'My Token')")
+        # Container für die dynamischen Widgets
+        self.metadata_fields_container = ctk.CTkFrame(self.metadata_frame, fg_color="transparent")
+        self.metadata_fields_container.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.metadata_fields_container.grid_columnconfigure(1, weight=1)
+        
+        self.pinata_jwt_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Pinata JWT Token hier einfügen", show="*")
+        self.pinata_jwt_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        self.token_name_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Name (z.B. 'My Token')")
         self.token_name_entry.bind("<KeyRelease>", self._on_config_change)
-        self.token_symbol_entry = ctk.CTkEntry(metadata_frame, placeholder_text="Token Symbol (z.B. 'MTK')")
+        
+        self.token_symbol_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Symbol (z.B. 'MTK')")
         self.token_symbol_entry.bind("<KeyRelease>", self._on_config_change)
-        self.token_uri_entry = ctk.CTkEntry(metadata_frame, placeholder_text="Metadaten URI (URL zu JSON-Datei)")
-        self.token_uri_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        self.select_image_button = ctk.CTkButton(self.metadata_fields_container, text="Token-Bild auswählen...", command=self._select_token_image)
+        self.selected_image_label = ctk.CTkLabel(self.metadata_fields_container, text="Kein Bild ausgewählt", font=ctk.CTkFont(size=10), text_color="gray")
 
     def _create_preview_tab(self, tab):
         """Erstellt den Vorschau-Tab"""
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=1)
         
-        # Header
         header_frame = ctk.CTkFrame(tab, fg_color="transparent")
         header_frame.grid(row=0, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
         header_frame.grid_columnconfigure(1, weight=1)
         
         ctk.CTkLabel(header_frame, text="📋 Setup-Vorschau", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w")
         
-        # Validierungs-Status
         self.validation_status = StatusIndicator(header_frame, status="unknown", text="Konfiguration prüfen...")
         self.validation_status.grid(row=0, column=1, sticky="e")
         
-        # Vorschau-Inhalt
         self.preview_textbox = ctk.CTkTextbox(tab, state="disabled", font=ctk.CTkFont(size=12, family="monospace"))
         self.preview_textbox.grid(row=1, column=0, sticky="nsew", padx=DesignSystem.SPACING['md'], pady=(0, DesignSystem.SPACING['md']))
 
@@ -438,10 +494,10 @@ class SetupUI(ctk.CTk):
         help_frame.grid(row=1, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
         ctk.CTkLabel(help_frame, text="💡 Tipps und Hinweise", font=ctk.CTkFont(size=16, weight="bold")).pack(padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), anchor="w")
         
-        help_text = "• Vanity-Adressen: Adressen mit Präfixen dauern länger zu generieren.\n• Testnutzer: Erstellt Wallets für Tests. Diese werden mit etwas SOL finanziert.\n• Explorer Link: Nach dem Setup wird ein Link zur Token-Mint angezeigt.\n• Backup: Alle Wallet-Dateien werden im konfigurierten Ordner gespeichert."
+        help_text = "• Vanity-Adressen: Adressen mit Präfixen dauern länger zu generieren.\n• Metadaten: Erstellt einen On-Chain-Account, der auf eine JSON-Datei (URI) verweist.\n• Explorer Link: Nach dem Setup wird ein Link zur Token-Mint angezeigt.\n• Backup: Alle Wallet-Dateien werden im konfigurierten Ordner gespeichert."
         ctk.CTkLabel(help_frame, text=help_text, justify="left", font=ctk.CTkFont(size=11)).pack(padx=DesignSystem.SPACING['md'], pady=(0, DesignSystem.SPACING['md']), anchor="w")
 
-    # === Event-Handler ===
+    # === Event-Handler und UI-Logik ===
     def _toggle_vanity_payer(self):
         if self.payer_vanity_check.get(): self.payer_prefix_entry.grid(row=0, column=1, padx=DesignSystem.SPACING['md'], sticky="w")
         else: self.payer_prefix_entry.grid_forget()
@@ -459,13 +515,51 @@ class SetupUI(ctk.CTk):
 
     def _toggle_metadata(self):
         if self.metadata_check.get():
-            self.token_name_entry.grid(row=2, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-            self.token_symbol_entry.grid(row=3, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-            self.token_uri_entry.grid(row=4, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['sm'], DesignSystem.SPACING['md']), sticky="ew")
+            self.pinata_jwt_entry.grid(row=0, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
+            self.token_name_entry.grid(row=1, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
+            self.token_symbol_entry.grid(row=2, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
+            self.select_image_button.grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+            self.selected_image_label.grid(row=3, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         else:
+            self.pinata_jwt_entry.grid_forget()
             self.token_name_entry.grid_forget()
             self.token_symbol_entry.grid_forget()
-            self.token_uri_entry.grid_forget()
+            self.select_image_button.grid_forget()
+            self.selected_image_label.grid_forget()
+        self._on_config_change()
+
+    def _select_token_image(self):
+        filepath = filedialog.askopenfilename(
+            title="Wählen Sie ein Bild für den Token",
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.gif")]
+        )
+        if not filepath:
+            self.setup_config.token_image_path = ""
+            self.selected_image_label.configure(text="Kein Bild ausgewählt")
+            self._on_config_change()
+            return
+
+        # --- Bildvalidierung ---
+        # 1. Dateigröße prüfen (max 100KB)
+        file_size_kb = os.path.getsize(filepath) / 1024
+        if file_size_kb > 100:
+            show_error(self, "Ungültiges Bild", f"Die Dateigröße ({file_size_kb:.1f} KB) überschreitet das Limit von 100 KB.")
+            return
+
+        # 2. Dimensionen prüfen
+        try:
+            with Image.open(filepath) as img:
+                width, height = img.size
+                if (width, height) not in [(512, 512), (1024, 1024)]:
+                    show_error(self, "Ungültiges Bild", f"Die Bild-Dimensionen ({width}x{height}) sind ungültig. Erlaubt sind 512x512 oder 1024x1024 Pixel.")
+                    return
+        except Exception as e:
+            show_error(self, "Bildfehler", f"Das Bild konnte nicht gelesen oder verarbeitet werden:\n{e}")
+            return
+
+        # Wenn alles ok ist:
+        self.setup_config.token_image_path = filepath
+        self.selected_image_label.configure(text=os.path.basename(filepath))
         self._on_config_change()
 
     def _on_slider_change(self, value):
@@ -494,9 +588,11 @@ class SetupUI(ctk.CTk):
         except (ValueError, TypeError): cfg.sol_for_users = 0.0
         
         cfg.create_metadata = self.metadata_check.get()
-        cfg.token_name = self.token_name_entry.get().strip()
-        cfg.token_symbol = self.token_symbol_entry.get().strip()
-        cfg.token_uri = self.token_uri_entry.get().strip()
+        if cfg.create_metadata:
+            cfg.token_name = self.token_name_entry.get().strip()
+            cfg.token_symbol = self.token_symbol_entry.get().strip()
+            cfg.pinata_jwt = self.pinata_jwt_entry.get().strip()
+        # cfg.token_image_path wird direkt in _select_token_image gesetzt
 
     def _update_preview(self):
         """Aktualisiert die Vorschau"""
@@ -524,6 +620,11 @@ class SetupUI(ctk.CTk):
             show_error(self, "Konfigurationsfehler", error_msg)
             return
         
+        # Speichere den JWT in der Konfiguration, bevor das Setup startet
+        if self.setup_config.create_metadata and self.setup_config.pinata_jwt:
+            self.config['pinata_jwt'] = self.setup_config.pinata_jwt
+            self._save_config()
+
         summary = "\n".join(self.setup_config.get_summary())
         message = f"Möchten Sie das Setup mit folgender Konfiguration starten?\n\n{summary}"
         if ConfirmDialog.show(self, "Setup starten?", message, confirm_text="Setup starten"):
@@ -558,8 +659,8 @@ class SetupUI(ctk.CTk):
                 ("Token-Konten erstellen & Nutzer finanzieren", self._setup_step_token_accounts),
                 ("Initiale Tokens minten", self._setup_step_initial_mint)
             ]
-            if self.setup_config.create_metadata and METADATA_LIB_AVAILABLE:
-                steps.insert(-1, ("Token-Metadaten erstellen", self._setup_step_metadata))
+            if self.setup_config.create_metadata:
+                steps.insert(4, ("Token-Metadaten erstellen & hochladen", self._setup_step_metadata)) # Nach Mint einfügen
             
             total_steps = len(steps)
             for i, (step_name, step_func) in enumerate(steps):
@@ -633,30 +734,47 @@ class SetupUI(ctk.CTk):
         confirm_and_send_transaction(self.http_client, [ix1, ix2], [self.payer_kp, self.mint_kp], "Token-Mint erstellen", self.log)
 
     def _setup_step_metadata(self):
-        metadata_pda, _ = Metadata.find_pda(self.mint_kp.pubkey())
-        data_v2 = DataV2(
-            name=self.setup_config.token_name, 
-            symbol=self.setup_config.token_symbol, 
-            uri=self.setup_config.token_uri, 
-            seller_fee_basis_points=0, 
-            creators=None, 
-            collection=None, 
-            uses=None
+        """Lädt Metadaten zu Pinata hoch und erstellt On-Chain Account."""
+        
+        jwt = self.setup_config.pinata_jwt
+
+        # 1. Bild hochladen
+        image_uri = "https://www.arweave.net/ef0JcIAftMvHnQ2iXk2S2E-R7mfn9vprgEU28htH1rk?ext=png" # Platzhalterbild
+        if self.setup_config.token_image_path:
+            uploaded_uri = _upload_file_to_pinata(self.setup_config.token_image_path, jwt, self.log)
+            if uploaded_uri:
+                image_uri = uploaded_uri
+            else:
+                self.log("⚠️ Bild-Upload fehlgeschlagen. Verwende Platzhalterbild.", "warning")
+
+        # 2. JSON-Datei erstellen
+        metadata_json = {
+            "name": self.setup_config.token_name,
+            "symbol": self.setup_config.token_symbol,
+            "description": f"Ein mit dem Setup-Tool erstellter Token.",
+            "image": image_uri,
+            "attributes": []
+        }
+
+        # 3. JSON-Datei hochladen, um die endgültige URI zu erhalten
+        json_filename = f"{self.setup_config.token_symbol}-metadata.json"
+        final_uri = _upload_json_to_pinata(metadata_json, json_filename, jwt, self.log)
+
+        if not final_uri:
+            raise Exception("Konnte Metadaten-URI von Pinata nicht abrufen. Breche ab.")
+        
+        self.setup_config.token_uri = final_uri # Wichtig: URI in der Konfig speichern
+
+        # 4. On-Chain-Metadaten-Instruktion erstellen und senden
+        instruction = self._create_metadata_instruction_manually()
+        
+        confirm_and_send_transaction(
+            self.http_client, 
+            [instruction], 
+            [self.payer_kp], 
+            "Token-Metadaten auf der Chain erstellen", 
+            self.log
         )
-        ix_args = CreateMetadataAccountV3InstructionArgs(
-            data=data_v2, 
-            is_mutable=True, 
-            collection_details=None
-        )
-        ix = create_metadata_account_v3(
-            args=ix_args,
-            metadata_account=metadata_pda,
-            mint=self.mint_kp.pubkey(),
-            mint_authority=self.payer_kp.pubkey(),
-            payer=self.payer_kp.pubkey(),
-            update_authority=self.payer_kp.pubkey()
-        )
-        confirm_and_send_transaction(self.http_client, [ix], [self.payer_kp], "Token-Metadaten erstellen", self.log)
 
     def _setup_step_token_accounts(self):
         instructions = []
@@ -755,6 +873,69 @@ class SetupUI(ctk.CTk):
                 raise TimeoutError("Guthaben nach 60s nicht gefunden.")
         else:
             self.log(f"{DesignSystem.ICONS['success']} Ausreichend Guthaben vorhanden.", "success")
+    
+    def _create_metadata_instruction_manually(self) -> Instruction:
+        """
+        Erstellt die `CreateMetadataAccountV3`-Instruktion manuell mittels borsh-construct.
+        """
+        self.log("→ Erstelle On-Chain Metadaten-Instruktion...", "info")
+
+        token_metadata_program = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
+        system_program = Pubkey.from_string('11111111111111111111111111111111')
+        
+        CollectionDetails = Enum("V1" / CStruct("size" / U64), enum_name="CollectionDetails")
+
+        instruction_structure = CStruct(
+            "instructionDiscriminator" / U8,
+            "createMetadataAccountArgsV3" / CStruct(
+                "data" / CStruct(
+                    "name" / String,
+                    "symbol" / String,
+                    "uri" / String,
+                    "sellerFeeBasisPoints" / U16,
+                    "creators" / Option(Vec(CStruct("address" / Bytes(32), "verified" / Bool, "share" / U8))),
+                    "collection" / Option(CStruct("verified" / Bool, "key" / Bytes(32))),
+                    "uses" / Option(CStruct("useMethod" / Enum("Burn", "Multiple", "Single", enum_name="UseMethod"), "remaining" / U64, "total" / U64))
+                ),
+                "isMutable" / Bool,
+                "collectionDetails" / Option(CollectionDetails)
+            )
+        )
+
+        instruction_data = {
+            "instructionDiscriminator": 33,
+            "createMetadataAccountArgsV3": {
+                "data": {
+                    "name": self.setup_config.token_name,
+                    "symbol": self.setup_config.token_symbol,
+                    "uri": self.setup_config.token_uri,
+                    "sellerFeeBasisPoints": 0,
+                    "creators": [{"address": bytes(self.payer_kp.pubkey()), "verified": True, "share": 100}],
+                    "collection": None,
+                    "uses": None
+                },
+                "isMutable": True,
+                "collectionDetails": None
+            }
+        }
+        
+        metadata_pda, _ = Pubkey.find_program_address(
+            [b"metadata", bytes(token_metadata_program), bytes(self.mint_kp.pubkey())],
+            token_metadata_program
+        )
+        self.log(f"   Metadaten-PDA berechnet: {metadata_pda}", "info")
+
+        accounts = [
+            AccountMeta(pubkey=metadata_pda, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=self.mint_kp.pubkey(), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=False),
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=True),
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=system_program, is_signer=False, is_writable=False),
+        ]
+
+        built_instruction = instruction_structure.build(instruction_data)
+        return Instruction(token_metadata_program, built_instruction, accounts)
 
     # === UI-Hilfsmethoden ===
     def _set_ui_state(self, is_enabled: bool):
@@ -765,7 +946,8 @@ class SetupUI(ctk.CTk):
             self.payer_vanity_check, self.payer_prefix_entry, self.mint_vanity_check, 
             self.mint_prefix_entry, self.test_user_slider, self.test_user_vanity_check, 
             self.test_user_prefix_entry, self.initial_mint_entry, self.sol_for_users_entry,
-            self.metadata_check, self.token_name_entry, self.token_symbol_entry, self.token_uri_entry
+            self.metadata_check, self.pinata_jwt_entry, self.token_name_entry, 
+            self.token_symbol_entry, self.select_image_button
         ]
         for widget in widgets_to_toggle:
             try: widget.configure(state=state)
@@ -795,13 +977,32 @@ class SetupUI(ctk.CTk):
         except queue.Empty: pass
         finally: self.after(200, self.process_log_queue)
 
+    def _save_config(self):
+        """Speichert die aktuelle Konfiguration in die Datei config.json."""
+        try:
+            with open("config.json", 'w') as f:
+                json.dump(self.config, f, indent=4)
+            self.log("Konfiguration gespeichert.", "info")
+        except Exception as e:
+            self.log(f"Fehler beim Speichern der config.json: {e}", "error")
+
     def load_and_display_config(self):
         try:
-            with open("config.json", 'r') as f: self.config = json.load(f)
+            if os.path.exists("config.json"):
+                with open("config.json", 'r') as f:
+                    self.config = json.load(f)
+            else:
+                self.config = {"rpc_url": "https://api.devnet.solana.com", "wallet_folder": "devnet_wallets"}
+                self._save_config()
+
             rpc_url = self.config.get('rpc_url', 'Nicht gefunden')
             wallet_folder = self.config.get('wallet_folder', 'Nicht gefunden')
             self.rpc_label.set_text(rpc_url)
             self.wallet_folder_label.set_text(wallet_folder)
+            
+            jwt_from_config = self.config.get('pinata_jwt')
+            if jwt_from_config:
+                self.pinata_jwt_entry.insert(0, jwt_from_config)
             
             try:
                 test_client = Client(rpc_url)
@@ -810,6 +1011,7 @@ class SetupUI(ctk.CTk):
             except: self.connection_status.set_status("error", "Verbindung fehlgeschlagen")
             
             self._check_for_existing_setup()
+            self._toggle_metadata() # Initial state for metadata fields
             self._on_config_change() # Initial preview update
         except Exception as e:
             show_error(self, "Config Fehler", f"config.json konnte nicht geladen werden: {e}")
@@ -854,6 +1056,10 @@ class SetupUI(ctk.CTk):
 
 
 if __name__ == "__main__":
+    # Überprüfen, ob die Hilfsdateien existieren
+    if not os.path.exists("ui_components.py"):
+        messagebox.showerror("Fehlende Dateien", "Stellen Sie sicher, dass 'ui_components.py' im selben Ordner wie 'setup.py' liegt.")
+        sys.exit(1)
+        
     app = SetupUI()
     app.mainloop()
-
