@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # === setup_ui_improved.py: Verbesserte grafische Benutzeroberfläche für das Solana Setup-Skript ===
-# Version mit UI-Konfiguration für Pinata JWT und Bildvalidierung
+# Version mit `isMutable`-Option für Metadaten
 
 import customtkinter as ctk
 import tkinter as tk
@@ -165,6 +165,7 @@ class SetupConfig:
         self.token_image_path = ""
         self.token_uri = ""
         self.pinata_jwt = ""
+        self.is_mutable = False
         
     def validate(self) -> Tuple[bool, str]:
         """Validiert die Konfiguration"""
@@ -221,6 +222,8 @@ class SetupConfig:
             summary.append(f"Metadaten: {self.token_name} ({self.token_symbol})")
             img_status = os.path.basename(self.token_image_path) if self.token_image_path else "Platzhalterbild"
             summary.append(f"Token-Bild: {img_status}")
+            mutable_status = "Ja (änderbar)" if self.is_mutable else "Nein (final)"
+            summary.append(f"Metadaten veränderbar: {mutable_status}")
         else:
             summary.append("Metadaten: Keine")
         
@@ -442,6 +445,8 @@ class SetupUI(ctk.CTk):
         
         self.select_image_button = ctk.CTkButton(self.metadata_fields_container, text="Token-Bild auswählen...", command=self._select_token_image)
         self.selected_image_label = ctk.CTkLabel(self.metadata_fields_container, text="Kein Bild ausgewählt", font=ctk.CTkFont(size=10), text_color="gray")
+        
+        self.is_mutable_check = ctk.CTkCheckBox(self.metadata_fields_container, text="Metadaten veränderbar machen (nicht empfohlen)", command=self._on_config_change)
 
     def _create_preview_tab(self, tab):
         """Erstellt den Vorschau-Tab"""
@@ -520,12 +525,14 @@ class SetupUI(ctk.CTk):
             self.token_symbol_entry.grid(row=2, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
             self.select_image_button.grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
             self.selected_image_label.grid(row=3, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+            self.is_mutable_check.grid(row=4, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         else:
             self.pinata_jwt_entry.grid_forget()
             self.token_name_entry.grid_forget()
             self.token_symbol_entry.grid_forget()
             self.select_image_button.grid_forget()
             self.selected_image_label.grid_forget()
+            self.is_mutable_check.grid_forget()
         self._on_config_change()
 
     def _select_token_image(self):
@@ -592,6 +599,7 @@ class SetupUI(ctk.CTk):
             cfg.token_name = self.token_name_entry.get().strip()
             cfg.token_symbol = self.token_symbol_entry.get().strip()
             cfg.pinata_jwt = self.pinata_jwt_entry.get().strip()
+            cfg.is_mutable = bool(self.is_mutable_check.get())
         # cfg.token_image_path wird direkt in _select_token_image gesetzt
 
     def _update_preview(self):
@@ -914,7 +922,7 @@ class SetupUI(ctk.CTk):
                     "collection": None,
                     "uses": None
                 },
-                "isMutable": True,
+                "isMutable": self.setup_config.is_mutable,
                 "collectionDetails": None
             }
         }
@@ -947,7 +955,7 @@ class SetupUI(ctk.CTk):
             self.mint_prefix_entry, self.test_user_slider, self.test_user_vanity_check, 
             self.test_user_prefix_entry, self.initial_mint_entry, self.sol_for_users_entry,
             self.metadata_check, self.pinata_jwt_entry, self.token_name_entry, 
-            self.token_symbol_entry, self.select_image_button
+            self.token_symbol_entry, self.select_image_button, self.is_mutable_check
         ]
         for widget in widgets_to_toggle:
             try: widget.configure(state=state)
