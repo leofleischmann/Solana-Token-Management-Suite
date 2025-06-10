@@ -3,6 +3,8 @@
 # Finale Version: Implementiert die erweiterte Borsh-Struktur und korrigiert
 # die booleschen Werte sowie die Account-Liste, um den "String is the wrong size"-Fehler endgültig zu beheben.
 # Update: Token-Beschreibung über UI anpassbar gemacht.
+# Update 2: Revoke-Optionen, Dezimalstellen, Social Links & Tags hinzugefügt.
+# Update 3: Tkinter-Geometrie-Fehler (grid/pack mix) behoben.
 
 import customtkinter as ctk
 import tkinter as tk
@@ -40,7 +42,7 @@ class DesignSystem:
     SPACING = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
     RADIUS = {"sm": 4, "md": 8, "lg": 12}
     ICONS = {
-        "settings": "⚙️", "start": "▶️", "wallet": "💼", "token": "�",
+        "settings": "⚙️", "start": "▶️", "wallet": "💼", "token": "🪙",
         "info": "ℹ️", "success": "✅", "error": "❌", "warning": "⚠️",
         "clipboard": "📋", "link": "🔗", "spinner": "⏳"
     }
@@ -223,7 +225,8 @@ try:
         get_associated_token_address,
         create_associated_token_account,
         mint_to, MintToParams,
-        initialize_mint, InitializeMintParams
+        initialize_mint, InitializeMintParams,
+        set_authority, SetAuthorityParams, AuthorityType
     )
     from spl.token.constants import TOKEN_PROGRAM_ID
 except ImportError as e:
@@ -349,14 +352,24 @@ class SetupConfig:
         self.sol_for_users = 0.05
         # Token
         self.initial_mint_amount = 1000000.0
+        self.token_decimals = 9
+        self.revoke_mint_authority = False
+        self.revoke_freeze_authority = False
         self.create_metadata = False
         self.token_name = ""
         self.token_symbol = ""
-        self.token_description = "" # NEU
+        self.token_description = ""
         self.token_image_path = ""
         self.token_uri = ""
         self.pinata_jwt = ""
-        self.is_mutable = False
+        self.revoke_update_authority = False # True = is_mutable: False
+        
+        # Social Links & Tags
+        self.token_website = ""
+        self.token_telegram = ""
+        self.token_discord = ""
+        self.token_twitter = ""
+        self.token_tags = ""
         
     def validate(self) -> Tuple[bool, str]:
         """Validiert die Konfiguration"""
@@ -380,6 +393,8 @@ class SetupConfig:
             return False, "SOL-Betrag für Nutzer darf nicht negativ sein."
         if self.test_user_count < 0 or self.test_user_count > 20:
             return False, "Anzahl Testnutzer muss zwischen 0 und 20 liegen."
+        if not (0 <= self.token_decimals <= 15):
+             return False, "Dezimalstellen müssen zwischen 0 und 15 liegen."
         
         if self.create_metadata:
             if not self.token_name.strip():
@@ -392,9 +407,12 @@ class SetupConfig:
             if len(self.token_symbol.strip().encode('utf-8')) > 10:
                 return False, f"Token-Symbol ist zu lang. Maximal 10 Bytes erlaubt (aktuell: {len(self.token_symbol.strip().encode('utf-8'))})."
             
-            # NEU: Validierung für Beschreibung
             if len(self.token_description.strip().encode('utf-8')) > 200:
                 return False, f"Token-Beschreibung ist zu lang. Maximal 200 Bytes erlaubt (aktuell: {len(self.token_description.strip().encode('utf-8'))})."
+
+            tags = [tag.strip() for tag in self.token_tags.split(',') if tag.strip()]
+            if len(tags) > 5:
+                return False, "Es sind maximal 5 Tags erlaubt."
 
             if not self.pinata_jwt.strip():
                 return False, "Pinata JWT Token ist für Metadaten erforderlich."
@@ -415,21 +433,36 @@ class SetupConfig:
         summary.extend([payer_desc, mint_desc, users_desc])
         
         # Token
-        summary.append(f"Initialer Vorrat: {self.initial_mint_amount:,.0f} Tokens")
+        summary.append(f"Initialer Vorrat: {self.initial_mint_amount:,.0f} Tokens mit {self.token_decimals} Dezimalstellen")
         if self.test_user_count > 0:
             summary.append(f"Finanzierung Nutzer: {self.sol_for_users} SOL pro Nutzer")
         
+        summary.append(f"Mint-Authority widerrufen: {'Ja' if self.revoke_mint_authority else 'Nein'}")
+        summary.append(f"Freeze-Authority widerrufen: {'Ja' if self.revoke_freeze_authority else 'Nein'}")
+
         if self.create_metadata:
             summary.append(f"Metadaten: {self.token_name} ({self.token_symbol})")
-            # NEU: Beschreibung zur Zusammenfassung hinzugefügt
             desc_preview = self.token_description.strip()[:50] + '...' if len(self.token_description.strip()) > 50 else self.token_description.strip()
             if desc_preview:
                 summary.append(f"Beschreibung: \"{desc_preview}\"")
 
             img_status = os.path.basename(self.token_image_path) if self.token_image_path else "Platzhalterbild"
             summary.append(f"Token-Bild: {img_status}")
-            mutable_status = "Ja (änderbar)" if self.is_mutable else "Nein (final)"
-            summary.append(f"Metadaten veränderbar: {mutable_status}")
+            mutable_status = "Ja, Metadaten werden gesperrt" if self.revoke_update_authority else "Nein, Metadaten bleiben änderbar"
+            summary.append(f"Update-Authority widerrufen: {mutable_status}")
+            
+            socials = []
+            if self.token_website: socials.append("Website")
+            if self.token_twitter: socials.append("Twitter")
+            if self.token_telegram: socials.append("Telegram")
+            if self.token_discord: socials.append("Discord")
+            if socials:
+                summary.append(f"Soziale Links: {', '.join(socials)}")
+            
+            tags = [tag.strip() for tag in self.token_tags.split(',') if tag.strip()]
+            if tags:
+                summary.append(f"Tags: {', '.join(tags)}")
+
         else:
             summary.append("Metadaten: Keine")
         
@@ -610,14 +643,25 @@ class SetupUI(ctk.CTk):
         self.initial_mint_entry.insert(0, "1000000")
         self.initial_mint_entry.grid(row=1, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.initial_mint_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        ctk.CTkLabel(token_frame, text="Dezimalstellen:").grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        self.token_decimals_entry = ctk.CTkEntry(token_frame, placeholder_text="z.B. 9", width=200)
+        self.token_decimals_entry.insert(0, "9")
+        self.token_decimals_entry.grid(row=2, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        self.token_decimals_entry.bind("<KeyRelease>", self._on_config_change)
 
-        ctk.CTkLabel(token_frame, text="SOL-Finanzierung für Testnutzer:").grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        ctk.CTkLabel(token_frame, text="SOL-Finanzierung für Testnutzer:").grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.sol_for_users_entry = ctk.CTkEntry(token_frame, placeholder_text="z.B. 0.05", width=200)
         self.sol_for_users_entry.insert(0, "0.05")
-        self.sol_for_users_entry.grid(row=2, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        self.sol_for_users_entry.grid(row=3, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         self.sol_for_users_entry.bind("<KeyRelease>", self._on_config_change)
         
-        ctk.CTkLabel(token_frame, text="").grid(row=3, column=0, pady=DesignSystem.SPACING['sm'])
+        revoke_frame = ctk.CTkFrame(token_frame, fg_color="transparent")
+        revoke_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['md']))
+        self.revoke_mint_check = ctk.CTkCheckBox(revoke_frame, text="Mint-Authority nach Setup widerrufen", command=self._on_config_change)
+        self.revoke_mint_check.pack(anchor="w")
+        self.revoke_freeze_check = ctk.CTkCheckBox(revoke_frame, text="Freeze-Authority nach Setup widerrufen", command=self._on_config_change)
+        self.revoke_freeze_check.pack(anchor="w", pady=(DesignSystem.SPACING['sm'], 0))
 
     def _create_metadata_config_section(self, parent):
         """Erstellt die Metadaten-Konfigurationssektion"""
@@ -640,6 +684,7 @@ class SetupUI(ctk.CTk):
         self.metadata_fields_container.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.metadata_fields_container.grid_columnconfigure(1, weight=1)
         
+        # Alle Widgets, die umgeschaltet werden, hier erstellen
         self.pinata_jwt_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Pinata JWT Token hier einfügen", show="*")
         self.pinata_jwt_entry.bind("<KeyRelease>", self._on_config_change)
         
@@ -649,14 +694,49 @@ class SetupUI(ctk.CTk):
         self.token_symbol_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Symbol (max. 10 Bytes)")
         self.token_symbol_entry.bind("<KeyRelease>", self._on_config_change)
 
-        # NEU: Eingabefeld für die Beschreibung
         self.token_description_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Beschreibung (optional, max. 200 Bytes)")
         self.token_description_entry.bind("<KeyRelease>", self._on_config_change)
         
-        self.select_image_button = ctk.CTkButton(self.metadata_fields_container, text="Token-Bild auswählen...", command=self._select_token_image)
-        self.selected_image_label = ctk.CTkLabel(self.metadata_fields_container, text="Kein Bild ausgewählt", font=ctk.CTkFont(size=10), text_color="gray")
+        # --- FIX: Dedizierter Frame für Bildauswahl ---
+        self.image_selection_frame = ctk.CTkFrame(self.metadata_fields_container, fg_color="transparent")
+        self.select_image_button = ctk.CTkButton(self.image_selection_frame, text="Token-Bild auswählen...", command=self._select_token_image)
+        self.select_image_button.grid(row=0, column=0, sticky="w")
+        self.selected_image_label = ctk.CTkLabel(self.image_selection_frame, text="Kein Bild ausgewählt", font=ctk.CTkFont(size=10), text_color="gray")
+        self.selected_image_label.grid(row=0, column=1, padx=DesignSystem.SPACING['md'], sticky="w")
         
-        self.is_mutable_check = ctk.CTkCheckBox(self.metadata_fields_container, text="Metadaten veränderbar machen (nicht empfohlen)", command=self._on_config_change)
+        # Socials und Tags Frames
+        self.socials_frame = ctk.CTkFrame(self.metadata_fields_container, fg_color="transparent")
+        self.socials_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.socials_frame, text="Webseite:", width=80).grid(row=0, column=0, padx=(0, DesignSystem.SPACING['sm']), sticky="w")
+        self.token_website_entry = ctk.CTkEntry(self.socials_frame, placeholder_text="https://...")
+        self.token_website_entry.grid(row=0, column=1, sticky="ew")
+        self.token_website_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        ctk.CTkLabel(self.socials_frame, text="Twitter:", width=80).grid(row=1, column=0, padx=(0, DesignSystem.SPACING['sm']), pady=(DesignSystem.SPACING['sm'], 0), sticky="w")
+        self.token_twitter_entry = ctk.CTkEntry(self.socials_frame, placeholder_text="https://twitter.com/...")
+        self.token_twitter_entry.grid(row=1, column=1, sticky="ew")
+        self.token_twitter_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        ctk.CTkLabel(self.socials_frame, text="Telegram:", width=80).grid(row=2, column=0, padx=(0, DesignSystem.SPACING['sm']), pady=(DesignSystem.SPACING['sm'], 0), sticky="w")
+        self.token_telegram_entry = ctk.CTkEntry(self.socials_frame, placeholder_text="https://t.me/...")
+        self.token_telegram_entry.grid(row=2, column=1, sticky="ew")
+        self.token_telegram_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        ctk.CTkLabel(self.socials_frame, text="Discord:", width=80).grid(row=3, column=0, padx=(0, DesignSystem.SPACING['sm']), pady=(DesignSystem.SPACING['sm'], 0), sticky="w")
+        self.token_discord_entry = ctk.CTkEntry(self.socials_frame, placeholder_text="https://discord.gg/...")
+        self.token_discord_entry.grid(row=3, column=1, sticky="ew")
+        self.token_discord_entry.bind("<KeyRelease>", self._on_config_change)
+        
+        self.tags_frame = ctk.CTkFrame(self.metadata_fields_container, fg_color="transparent")
+        self.tags_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.tags_frame, text="Tags:", width=80).grid(row=0, column=0, padx=(0, DesignSystem.SPACING['sm']), sticky="w")
+        self.token_tags_entry = ctk.CTkEntry(self.tags_frame, placeholder_text="meme, cat, airdrop, ... (kommagetrennt)")
+        self.token_tags_entry.grid(row=0, column=1, sticky="ew")
+        self.token_tags_entry.bind("<KeyRelease>", self._on_tags_change)
+        self.tags_count_label = ctk.CTkLabel(self.tags_frame, text="0/5 Tags", font=ctk.CTkFont(size=10))
+        self.tags_count_label.grid(row=0, column=2, padx=(DesignSystem.SPACING['sm'], 0))
+
+        self.revoke_update_authority_check = ctk.CTkCheckBox(self.metadata_fields_container, text="Update-Authority für Metadaten widerrufen (finalisieren)", command=self._on_config_change)
 
     def _create_preview_tab(self, tab):
         """Erstellt den Vorschau-Tab"""
@@ -709,7 +789,7 @@ class SetupUI(ctk.CTk):
         help_frame.grid(row=1, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
         ctk.CTkLabel(help_frame, text="💡 Tipps und Hinweise", font=ctk.CTkFont(size=16, weight="bold")).pack(padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), anchor="w")
         
-        help_text = "• Vanity-Adressen: Adressen mit Präfixen dauern länger zu generieren.\n• Metadaten: Erstellt einen On-Chain-Account, der auf eine JSON-Datei (URI) verweist.\n• Explorer Link: Nach dem Setup wird ein Link zur Token-Mint angezeigt.\n• Backup: Alle Wallet-Dateien werden im konfigurierten Ordner gespeichert."
+        help_text = "• Vanity-Adressen: Adressen mit Präfixen dauern länger zu generieren.\n• Metadaten: Erstellt einen On-Chain-Account, der auf eine JSON-Datei (URI) verweist.\n• Explorer Link: Nach dem Setup wird ein Link zur Token-Mint angezeigt.\n• Backup: Alle Wallet-Dateien werden im konfigurierten Ordner gespeichert.\n• Revoke: Einmal widerrufene Berechtigungen (Mint, Freeze, Update) können nicht wiederhergestellt werden."
         ctk.CTkLabel(help_frame, text=help_text, justify="left", font=ctk.CTkFont(size=11)).pack(padx=DesignSystem.SPACING['md'], pady=(0, DesignSystem.SPACING['md']), anchor="w")
 
     # === Event-Handler und UI-Logik ===
@@ -729,27 +809,31 @@ class SetupUI(ctk.CTk):
         self._on_config_change()
 
     def _toggle_metadata(self):
-        row_counter = 0
+        """Schaltet die Sichtbarkeit der Metadaten-Felder um. KORRIGIERTE VERSION."""
+        # Zuerst alle Widgets im Container ausblenden, um einen sauberen Zustand zu schaffen
+        for widget in self.metadata_fields_container.winfo_children():
+            widget.grid_forget()
+
+        # Wenn die Checkbox aktiviert ist, die Widgets wieder einblenden
         if self.metadata_check.get():
-            self.pinata_jwt_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
-            self.token_name_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
-            self.token_symbol_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
-            # NEU: Beschreibung anzeigen
-            self.token_description_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
+            row_counter = 0
             
-            self.select_image_button.grid(row=row_counter, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-            self.selected_image_label.grid(row=row_counter, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w"); row_counter += 1
-            
-            self.is_mutable_check.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w"); row_counter += 1
-        else:
-            self.pinata_jwt_entry.grid_forget()
-            self.token_name_entry.grid_forget()
-            self.token_symbol_entry.grid_forget()
-            # NEU: Beschreibung ausblenden
-            self.token_description_entry.grid_forget()
-            self.select_image_button.grid_forget()
-            self.selected_image_label.grid_forget()
-            self.is_mutable_check.grid_forget()
+            # Hilfsfunktion, um das Hinzufügen von Widgets zu vereinfachen
+            def grid_widget(widget, pady=DesignSystem.SPACING['sm'], columnspan=2, sticky="ew"):
+                nonlocal row_counter
+                widget.grid(row=row_counter, column=0, columnspan=columnspan, padx=DesignSystem.SPACING['md'], pady=pady, sticky=sticky)
+                row_counter += 1
+
+            grid_widget(self.pinata_jwt_entry)
+            grid_widget(self.token_name_entry)
+            grid_widget(self.token_symbol_entry)
+            grid_widget(self.token_description_entry)
+            grid_widget(self.image_selection_frame, sticky="w") # Frame für Bildauswahl
+            grid_widget(self.socials_frame)
+            grid_widget(self.tags_frame)
+            grid_widget(self.revoke_update_authority_check, sticky="w")
+
+        # Konfiguration und Vorschau nach jeder Änderung aktualisieren
         self._on_config_change()
 
     def _select_token_image(self):
@@ -763,7 +847,6 @@ class SetupUI(ctk.CTk):
             self._on_config_change()
             return
 
-        # --- Bildvalidierung ---
         file_size_kb = os.path.getsize(filepath) / 1024
         if file_size_kb > 100:
             show_error(self, "Ungültiges Bild", f"Die Dateigröße ({file_size_kb:.1f} KB) überschreitet das Limit von 100 KB.")
@@ -786,6 +869,17 @@ class SetupUI(ctk.CTk):
     def _on_slider_change(self, value):
         self.test_user_label.configure(text=str(int(value)))
         self._on_config_change()
+    
+    def _on_tags_change(self, event=None):
+        tags_text = self.token_tags_entry.get()
+        tags = [tag.strip() for tag in tags_text.split(',') if tag.strip()]
+        count = len(tags)
+        self.tags_count_label.configure(text=f"{count}/5 Tags")
+        if count > 5:
+            self.tags_count_label.configure(text_color=DesignSystem.COLORS['error'])
+        else:
+            self.tags_count_label.configure(text_color=DesignSystem.COLORS['text_secondary'])
+        self._on_config_change()
 
     def _on_config_change(self, event=None):
         if not self.setup_exists:
@@ -805,18 +899,27 @@ class SetupUI(ctk.CTk):
         
         try: cfg.initial_mint_amount = float(self.initial_mint_entry.get().replace(",", "."))
         except (ValueError, TypeError): cfg.initial_mint_amount = 0.0
+        try: cfg.token_decimals = int(self.token_decimals_entry.get())
+        except (ValueError, TypeError): cfg.token_decimals = 9
         try: cfg.sol_for_users = float(self.sol_for_users_entry.get().replace(",", "."))
         except (ValueError, TypeError): cfg.sol_for_users = 0.0
         
+        cfg.revoke_mint_authority = bool(self.revoke_mint_check.get())
+        cfg.revoke_freeze_authority = bool(self.revoke_freeze_check.get())
+
         cfg.create_metadata = self.metadata_check.get()
         if cfg.create_metadata:
             cfg.token_name = self.token_name_entry.get().strip()
             cfg.token_symbol = self.token_symbol_entry.get().strip()
-            # NEU: Beschreibung aus UI lesen
             cfg.token_description = self.token_description_entry.get().strip()
             cfg.pinata_jwt = self.pinata_jwt_entry.get().strip()
-            cfg.is_mutable = bool(self.is_mutable_check.get())
-        # cfg.token_image_path wird direkt in _select_token_image gesetzt
+            cfg.revoke_update_authority = bool(self.revoke_update_authority_check.get())
+            
+            cfg.token_website = self.token_website_entry.get().strip()
+            cfg.token_twitter = self.token_twitter_entry.get().strip()
+            cfg.token_telegram = self.token_telegram_entry.get().strip()
+            cfg.token_discord = self.token_discord_entry.get().strip()
+            cfg.token_tags = self.token_tags_entry.get()
 
     def _update_preview(self):
         """Aktualisiert die Vorschau"""
@@ -880,10 +983,11 @@ class SetupUI(ctk.CTk):
                 ("Payer finanzieren", self._setup_step_funding),
                 ("Token-Mint erstellen", self._setup_step_mint),
                 ("Token-Konten erstellen & Nutzer finanzieren", self._setup_step_token_accounts),
-                ("Initiale Tokens minten", self._setup_step_initial_mint)
+                ("Initiale Tokens minten", self._setup_step_initial_mint),
+                ("Berechtigungen widerrufen", self._setup_step_revoke_authorities),
             ]
             if self.setup_config.create_metadata:
-                steps.insert(4, ("Token-Metadaten erstellen & hochladen", self._setup_step_metadata)) # Nach Mint einfügen
+                steps.insert(4, ("Token-Metadaten erstellen & hochladen", self._setup_step_metadata))
             
             total_steps = len(steps)
             for i, (step_name, step_func) in enumerate(steps):
@@ -949,7 +1053,7 @@ class SetupUI(ctk.CTk):
             InitializeMintParams(
                 program_id=TOKEN_PROGRAM_ID,
                 mint=self.mint_kp.pubkey(),
-                decimals=9,
+                decimals=self.setup_config.token_decimals,
                 mint_authority=self.payer_kp.pubkey(),
                 freeze_authority=self.payer_kp.pubkey()
             )
@@ -958,46 +1062,53 @@ class SetupUI(ctk.CTk):
 
     def _setup_step_metadata(self):
         """Lädt Metadaten zu Pinata hoch und erstellt On-Chain Account."""
-        
-        jwt = self.setup_config.pinata_jwt
+        cfg = self.setup_config
+        jwt = cfg.pinata_jwt
 
         # 1. Bild hochladen
         image_uri = "https://www.arweave.net/ef0JcIAftMvHnQ2iXk2S2E-R7mfn9vprgEU28htH1rk?ext=png" # Platzhalterbild
-        if self.setup_config.token_image_path:
-            uploaded_uri = _upload_file_to_pinata(self.setup_config.token_image_path, jwt, self.log)
-            if uploaded_uri:
-                image_uri = uploaded_uri
-            else:
-                self.log("⚠️ Bild-Upload fehlgeschlagen. Verwende Platzhalterbild.", "warning")
+        if cfg.token_image_path:
+            uploaded_uri = _upload_file_to_pinata(cfg.token_image_path, jwt, self.log)
+            if uploaded_uri: image_uri = uploaded_uri
+            else: self.log("⚠️ Bild-Upload fehlgeschlagen. Verwende Platzhalterbild.", "warning")
 
         # 2. JSON-Datei erstellen
         metadata_json = {
-            "name": self.setup_config.token_name,
-            "symbol": self.setup_config.token_symbol,
-            # NEU: Beschreibung aus der Konfiguration verwenden
-            "description": self.setup_config.token_description or "Ein mit dem Setup-Tool erstellter Token.",
+            "name": cfg.token_name,
+            "symbol": cfg.token_symbol,
+            "description": cfg.token_description or "Ein mit dem Setup-Tool erstellter Token.",
             "image": image_uri,
-            "attributes": []
         }
+        
+        # Tags als 'attributes' hinzufügen
+        tags = [t.strip() for t in cfg.token_tags.split(',') if t.strip()]
+        if tags:
+            metadata_json["attributes"] = [{"trait_type": "Tag", "value": tag} for tag in tags]
+        
+        # Socials als 'extensions' hinzufügen
+        extensions = {}
+        if cfg.token_website: extensions["website"] = cfg.token_website
+        if cfg.token_twitter: extensions["twitter"] = cfg.token_twitter
+        if cfg.token_telegram: extensions["telegram"] = cfg.token_telegram
+        if cfg.token_discord: extensions["discord"] = cfg.token_discord
+        if extensions:
+            metadata_json["extensions"] = extensions
 
         # 3. JSON-Datei hochladen, um die endgültige URI zu erhalten
-        json_filename = f"{self.setup_config.token_symbol}-metadata.json"
+        json_filename = f"{cfg.token_symbol}-metadata.json"
         final_uri = _upload_json_to_pinata(metadata_json, json_filename, jwt, self.log)
 
         if not final_uri:
             raise Exception("Konnte Metadaten-URI von Pinata nicht abrufen. Breche ab.")
         
-        self.setup_config.token_uri = final_uri
+        cfg.token_uri = final_uri
 
         # 4. On-Chain-Metadaten-Instruktion erstellen und senden
         instruction = self._create_metadata_instruction_manually()
         
         confirm_and_send_transaction(
-            self.http_client, 
-            [instruction], 
-            [self.payer_kp], 
-            "Token-Metadaten auf der Chain erstellen", 
-            self.log
+            self.http_client, [instruction], [self.payer_kp], 
+            "Token-Metadaten auf der Chain erstellen", self.log
         )
 
     def _setup_step_token_accounts(self):
@@ -1026,7 +1137,12 @@ class SetupUI(ctk.CTk):
             confirm_and_send_transaction(self.http_client, instructions, [self.payer_kp], "ATAs erstellen & Nutzer finanzieren", self.log)
 
     def _setup_step_initial_mint(self):
-        amount_lamports = int(self.setup_config.initial_mint_amount * (10**9))
+        cfg = self.setup_config
+        if cfg.revoke_mint_authority and cfg.initial_mint_amount == 0:
+            self.log("Mint-Authority wird widerrufen, aber es werden keine Tokens gemintet. Überspringe Minting.", "warning")
+            return
+        
+        amount = int(cfg.initial_mint_amount * (10**cfg.token_decimals))
         ata = get_associated_token_address(owner=self.payer_kp.pubkey(), mint=self.mint_kp.pubkey())
         ix = mint_to(
             MintToParams(
@@ -1034,10 +1150,40 @@ class SetupUI(ctk.CTk):
                 mint=self.mint_kp.pubkey(),
                 dest=ata,
                 mint_authority=self.payer_kp.pubkey(),
-                amount=amount_lamports
+                amount=amount
             )
         )
-        confirm_and_send_transaction(self.http_client, [ix], [self.payer_kp], f"{self.setup_config.initial_mint_amount:,.0f} Tokens minten", self.log)
+        confirm_and_send_transaction(self.http_client, [ix], [self.payer_kp], f"{cfg.initial_mint_amount:,.0f} Tokens minten", self.log)
+
+    def _setup_step_revoke_authorities(self):
+        """Widerruft optional Mint- und/oder Freeze-Authority."""
+        cfg = self.setup_config
+        instructions = []
+
+        if cfg.revoke_mint_authority:
+            self.log("→ Bereite Instruktion zum Widerrufen der Mint-Authority vor...", "info")
+            instructions.append(set_authority(SetAuthorityParams(
+                program_id=TOKEN_PROGRAM_ID,
+                account=self.mint_kp.pubkey(),
+                authority=AuthorityType.MINT_TOKENS,
+                current_authority=self.payer_kp.pubkey(),
+                new_authority=None
+            )))
+
+        if cfg.revoke_freeze_authority:
+            self.log("→ Bereite Instruktion zum Widerrufen der Freeze-Authority vor...", "info")
+            instructions.append(set_authority(SetAuthorityParams(
+                program_id=TOKEN_PROGRAM_ID,
+                account=self.mint_kp.pubkey(),
+                authority=AuthorityType.FREEZE_ACCOUNT,
+                current_authority=self.payer_kp.pubkey(),
+                new_authority=None
+            )))
+        
+        if instructions:
+            confirm_and_send_transaction(self.http_client, instructions, [self.payer_kp], "Authorities widerrufen", self.log)
+        else:
+            self.log("Keine Berechtigungen zum Widerrufen ausgewählt.", "info")
 
     def _create_wallet_ui_driven(self, wallet_folder, filename, wallet_type, use_vanity, prefix):
         self.log(f"→ Erstelle '{wallet_type}'-Wallet...", "info")
@@ -1050,14 +1196,12 @@ class SetupUI(ctk.CTk):
         with open(os.path.join(wallet_folder, filename), 'w') as f:
             json.dump(list(bytes(keypair)), f)
             
-        # TXT speichern (Hex-String)
         hex_str = ''.join(f'{b:02x}' for b in bytes(keypair))
         filename_txt = filename.rsplit('.', 1)[0] + '.txt'
         path_txt = os.path.join(wallet_folder, filename_txt)
         with open(path_txt, 'w') as f:
             f.write(hex_str)
             
-        
         self.log(f"   {DesignSystem.ICONS['success']} Wallet gespeichert: {truncate_address(str(keypair.pubkey()))}", "success")
         return keypair
 
@@ -1108,7 +1252,9 @@ class SetupUI(ctk.CTk):
             self.log(f"{DesignSystem.ICONS['success']} Ausreichend Guthaben vorhanden.", "success")
     
     def _create_metadata_instruction_manually(self) -> Instruction:
-        self.log("→ Erstelle On-Chain Metadaten-Instruktion (finale Methode)...", "info")
+        self.log("→ Erstelle On-Chain Metadaten-Instruktion...", "info")
+        cfg = self.setup_config
+        is_mutable = not cfg.revoke_update_authority
 
         token_metadata_program = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
         system_program = Pubkey.from_string('11111111111111111111111111111111')
@@ -1145,21 +1291,17 @@ class SetupUI(ctk.CTk):
             "instructionDiscriminator": 33,
             "createMetadataAccountArgsV3": {
                 "data": {
-                    "name": self.setup_config.token_name,
-                    "symbol": self.setup_config.token_symbol,
-                    "uri": self.setup_config.token_uri,
+                    "name": cfg.token_name,
+                    "symbol": cfg.token_symbol,
+                    "uri": cfg.token_uri,
                     "sellerFeeBasisPoints": 0,
-                    "creators": [
-                        {
-                            "address": bytes(self.payer_kp.pubkey()),
-                            "verified": 1,
-                            "share": 100
-                        }
-                    ],
-                    "collection": None,
-                    "uses": None
+                    "creators": [{
+                        "address": bytes(self.payer_kp.pubkey()),
+                        "verified": 1, "share": 100
+                    }],
+                    "collection": None, "uses": None
                 },
-                "isMutable": 1 if self.setup_config.is_mutable else 0,
+                "isMutable": 1 if is_mutable else 0,
                 "collectionDetails": None
             }
         }
@@ -1191,9 +1333,12 @@ class SetupUI(ctk.CTk):
             self.payer_vanity_check, self.payer_prefix_entry, self.mint_vanity_check, 
             self.mint_prefix_entry, self.test_user_slider, self.test_user_vanity_check, 
             self.test_user_prefix_entry, self.initial_mint_entry, self.sol_for_users_entry,
+            self.token_decimals_entry, self.revoke_mint_check, self.revoke_freeze_check,
             self.metadata_check, self.pinata_jwt_entry, self.token_name_entry, 
-            self.token_symbol_entry, self.token_description_entry, # NEU
-            self.select_image_button, self.is_mutable_check
+            self.token_symbol_entry, self.token_description_entry, 
+            self.select_image_button, self.revoke_update_authority_check,
+            self.token_website_entry, self.token_twitter_entry, self.token_telegram_entry,
+            self.token_discord_entry, self.token_tags_entry
         ]
         for widget in widgets_to_toggle:
             try: widget.configure(state=state)
@@ -1257,6 +1402,9 @@ class SetupUI(ctk.CTk):
             except: self.connection_status.set_status("error", "Verbindung fehlgeschlagen")
             
             self._check_for_existing_setup()
+            self._toggle_vanity_payer()
+            self._toggle_vanity_mint()
+            self._toggle_vanity_users()
             self._toggle_metadata() 
             self._on_config_change() 
         except Exception as e:
