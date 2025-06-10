@@ -3,8 +3,8 @@
 # Verbesserte Version: Integrierte UI-Komponenten, dynamische Dezimalstellen,
 # und benutzerfreundlichere Interaktionen. Skalierungsfähige Schriftarten implementiert.
 # Update: Liest Token-Name/Symbol und deaktiviert UI-Elemente basierend auf widerrufenen Authorities.
-# Bugfix: Korrigiert die doppelte Dekodierung von Blockchain-Daten (TypeError).
-# Feature: Grundlegende Unterstützung für Token-2022 hinzugefügt.
+# Bugfix: Absturz bei 0 Testnutzern behoben (AttributeError).
+# Bugfix: Mögliche Inkompatibilität mit älteren spl-token-Versionen behoben.
 
 import customtkinter as ctk
 import tkinter as tk
@@ -45,7 +45,7 @@ class DesignSystem:
     ICONS = {
         "settings": "⚙️", "wallet": "💼", "token": "🪙", "sol": "◎",
         "info": "ℹ️", "success": "✅", "error": "❌", "warning": "⚠️",
-        "clipboard": "📋", "link": "�", "spinner": "⏳", "refresh": "🔄",
+        "clipboard": "📋", "link": "🔗", "spinner": "⏳", "refresh": "🔄",
         "mint": "✨", "burn": "🔥", "send": "➡️", 
         "freeze": "❄️", "thaw": "☀️", "execute": "▶️"
     }
@@ -538,7 +538,8 @@ class SolanaTokenUI(ctk.CTk):
                 status = {"name": name, "address": str(kp.pubkey())}
                 try:
                     status["sol_balance"] = format_sol_amount(self.http_client.get_balance(kp.pubkey()).value)
-                    ata = get_associated_token_address(kp.pubkey(), mint_pk, self.token_program_id)
+                    # BUGFIX: The get_associated_token_address helper does NOT take a token_program_id.
+                    ata = get_associated_token_address(kp.pubkey(), mint_pk)
                     status["ata_address"] = str(ata)
                     try:
                         balance = self.http_client.get_token_account_balance(ata).value
@@ -569,28 +570,22 @@ class SolanaTokenUI(ctk.CTk):
         """Holt Token-Informationen (Name, Symbol, Authorities) von der Blockchain."""
         mint_pubkey = self.wallets['mint'].pubkey()
         try:
-            # Mint Account Info für Authorities und Dezimalstellen
             mint_account_info = self.http_client.get_account_info(mint_pubkey).value
             if mint_account_info and mint_account_info.data:
-                # Programm-ID des Tokens bestimmen (Owner des Mint-Kontos)
                 self.token_program_id = mint_account_info.owner
                 
                 data = mint_account_info.data
                 
-                # Mint Authority (Option<Pubkey>) an Offset 0 (36 Bytes)
                 mint_authority_option = struct.unpack('<I', data[0:4])[0]
                 self.has_mint_authority = (mint_authority_option == 1)
                 
-                # Decimals an Offset 44
                 self.TOKEN_DECIMALS = struct.unpack('<B', data[44:45])[0]
                 
-                # Freeze Authority (Option<Pubkey>) an Offset 46
                 freeze_authority_option = struct.unpack('<I', data[46:50])[0]
                 self.has_freeze_authority = (freeze_authority_option == 1)
             else:
                 self.log("Konnte Mint-Account nicht finden oder Daten sind leer.", "error")
 
-            # Metadaten für Name und Symbol
             metadata_pda, _ = Pubkey.find_program_address(
                 [b"metadata", bytes(TOKEN_METADATA_PROGRAM_ID), bytes(mint_pubkey)],
                 TOKEN_METADATA_PROGRAM_ID
@@ -598,13 +593,10 @@ class SolanaTokenUI(ctk.CTk):
             metadata_account_info = self.http_client.get_account_info(metadata_pda).value
             if metadata_account_info and metadata_account_info.data:
                 metadata = metadata_account_info.data
-
-                # Name (String) beginnt bei Offset 65
                 name_len = struct.unpack('<I', metadata[65:69])[0]
                 name_bytes = metadata[69 : 69 + name_len]
                 self.token_name = name_bytes.decode('utf-8').strip('\x00')
                 
-                # Symbol (String) beginnt nach dem Namen
                 symbol_offset = 69 + name_len
                 symbol_len = struct.unpack('<I', metadata[symbol_offset : symbol_offset + 4])[0]
                 symbol_bytes = metadata[symbol_offset + 4 : symbol_offset + 4 + symbol_len]
@@ -622,7 +614,6 @@ class SolanaTokenUI(ctk.CTk):
         mint_state = "normal" if self.has_mint_authority else "disabled"
         self.mint_amount_entry.configure(state=mint_state)
         self.mint_button.configure(state=mint_state)
-        # Burn bleibt immer aktiv, da es die eigene Balance betrifft.
 
         freeze_state = "normal" if self.has_freeze_authority else "disabled"
         for widget in self.freeze_thaw_frame.winfo_children():
@@ -637,11 +628,14 @@ class SolanaTokenUI(ctk.CTk):
         self.burn_amount_entry.configure(placeholder_text=f"Anzahl {self.token_symbol}")
         
         self.issuer_spl_widgets['title'].configure(text=f"{DesignSystem.ICONS['token']} {self.token_name} senden")
-        self.user_spl_widgets['title'].configure(text=f"{DesignSystem.ICONS['token']} {self.token_name} senden")
+        if hasattr(self, 'user_spl_widgets'):
+            self.user_spl_widgets['title'].configure(text=f"{DesignSystem.ICONS['token']} {self.token_name} senden")
+        
         self.freeze_thaw_title_label.configure(text=f"{DesignSystem.ICONS['freeze']} {self.token_name}-Konto sperren/entsperren")
         
         program_name = "Token-2022" if self.token_program_id == TOKEN_2022_PROGRAM_ID else "Standard SPL Token"
-        self.token_program_label.configure(text=program_name)
+        if hasattr(self, 'token_program_label'):
+            self.token_program_label.configure(text=program_name)
 
     def _update_status_ui(self, statuses):
         for widget in self.status_scroll_frame.winfo_children(): widget.destroy()
@@ -710,7 +704,7 @@ class SolanaTokenUI(ctk.CTk):
             else:
                 wallet_pubkey = self.wallet_names_map[wallet_name]
 
-            ata_pubkey = get_associated_token_address(wallet_pubkey, self.wallets['mint'].pubkey(), self.token_program_id)
+            ata_pubkey = get_associated_token_address(wallet_pubkey, self.wallets['mint'].pubkey())
             action = "freeze" if DesignSystem.ICONS['freeze'] in self.freeze_thaw_action.get() else "thaw"
             action_german = "sperren" if action == "freeze" else "entsperren"
 
@@ -756,7 +750,7 @@ class SolanaTokenUI(ctk.CTk):
 
     def _execute_mint_thread(self, amount, button):
         amount_lamports = int(amount * (10**self.TOKEN_DECIMALS))
-        ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey(), self.token_program_id)
+        ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey())
         ix = mint_to(MintToParams(self.token_program_id, self.wallets['mint'].pubkey(), ata, self.wallets['payer'].pubkey(), amount_lamports))
         if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} {self.token_name} minten"):
             self.after(0, self.start_status_refresh)
@@ -764,7 +758,7 @@ class SolanaTokenUI(ctk.CTk):
 
     def _execute_burn_thread(self, amount, button):
         amount_lamports = int(amount * (10**self.TOKEN_DECIMALS))
-        ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey(), self.token_program_id)
+        ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey())
         ix = burn(BurnParams(self.token_program_id, ata, self.wallets['mint'].pubkey(), self.wallets['payer'].pubkey(), amount_lamports))
         if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} {self.token_name} verbrennen"):
             self.after(0, self.start_status_refresh)
@@ -780,11 +774,11 @@ class SolanaTokenUI(ctk.CTk):
         instructions = []
         if transfer_type == "spl":
             amount_lamports = int(amount * (10**self.TOKEN_DECIMALS))
-            source_ata = get_associated_token_address(sender_kp.pubkey(), self.wallets['mint'].pubkey(), self.token_program_id)
-            dest_ata = get_associated_token_address(dest_pubkey, self.wallets['mint'].pubkey(), self.token_program_id)
+            source_ata = get_associated_token_address(sender_kp.pubkey(), self.wallets['mint'].pubkey())
+            dest_ata = get_associated_token_address(dest_pubkey, self.wallets['mint'].pubkey())
             if self.http_client.get_account_info(dest_ata).value is None:
                 self.log(f"→ {self.token_name}-Konto (ATA) existiert nicht, wird automatisch erstellt.", "info")
-                instructions.append(create_associated_token_account(sender_kp.pubkey(), dest_pubkey, self.wallets['mint'].pubkey(), self.token_program_id))
+                instructions.append(create_associated_token_account(sender_kp.pubkey(), dest_pubkey, self.wallets['mint'].pubkey()))
             instructions.append(spl_transfer(SplTransferParams(self.token_program_id, source_ata, dest_ata, sender_kp.pubkey(), amount_lamports)))
             label = f"Überweise {amount} {self.token_name}"
         else: # sol
@@ -802,3 +796,4 @@ if __name__ == "__main__":
             app.mainloop()
     except Exception as e:
         messagebox.showerror("Unerwarteter Fehler", f"Ein schwerwiegender Fehler ist aufgetreten:\n\n{e}")
+
