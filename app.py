@@ -2,6 +2,8 @@
 # === app.py: Grafische Benutzeroberfläche für das Solana Token Management Tool ===
 # Verbesserte Version: Integrierte UI-Komponenten, dynamische Dezimalstellen,
 # und benutzerfreundlichere Interaktionen. Skalierungsfähige Schriftarten implementiert.
+# Update: Liest Token-Name/Symbol und deaktiviert UI-Elemente basierend auf widerrufenen Authorities.
+# Bugfix: Korrigiert die doppelte Dekodierung von Blockchain-Daten (TypeError).
 
 import customtkinter as ctk
 import tkinter as tk
@@ -13,6 +15,8 @@ import sys
 import json
 import webbrowser
 from typing import Dict, List, Optional, Tuple, Callable
+import struct
+from base64 import b64decode
 
 # =================================================================================
 # === Integrierte UI-Komponenten (wie in setup.py) ===
@@ -40,7 +44,7 @@ class DesignSystem:
     ICONS = {
         "settings": "⚙️", "wallet": "💼", "token": "🪙", "sol": "◎",
         "info": "ℹ️", "success": "✅", "error": "❌", "warning": "⚠️",
-        "clipboard": "📋", "link": "🔗", "spinner": "⏳", "refresh": "🔄",
+        "clipboard": "📋", "link": "🔗", "spinner": "⏳", "refresh": "�",
         "mint": "✨", "burn": "🔥", "send": "➡️", 
         "freeze": "❄️", "thaw": "☀️", "execute": "▶️"
     }
@@ -99,7 +103,6 @@ class EnhancedTextbox(ctk.CTkTextbox):
         self.tag_config("error", foreground=DesignSystem.COLORS['error'])
         self.tag_config("warning", foreground=DesignSystem.COLORS['warning'])
         self.tag_config("info", foreground=DesignSystem.COLORS['text_secondary'])
-        # font parameter removed for scaling compatibility
         self.tag_config("header", foreground=DesignSystem.COLORS['log_header'])
 
     def append_text(self, message, level="info"):
@@ -159,6 +162,7 @@ try:
     from solders.system_program import transfer as system_transfer, TransferParams as SystemTransferParams
     from solders.transaction import Transaction
     from solana.rpc.api import Client
+    from solana.rpc.types import TokenAccountOpts
     from solana.exceptions import SolanaRpcException
     from spl.token.instructions import (
         transfer as spl_transfer, TransferParams as SplTransferParams,
@@ -168,10 +172,12 @@ try:
     )
     from spl.token.constants import TOKEN_PROGRAM_ID
 except ImportError as e:
-    messagebox.showerror("Fehler: Fehlende Bibliotheken", f"Eine oder mehrere erforderliche Python-Bibliotheken fehlen. ({e})\n\nBitte installieren Sie diese mit:\npip install solders solana spl-token-py customtkinter")
+    messagebox.showerror("Fehler: Fehlende Bibliotheken", f"Eine oder mehrere erforderliche Python-Bibliotheken fehlen. ({e})\n\nBitte installieren Sie diese mit:\npip install solana solders spl-token-py customtkinter")
     sys.exit(1)
 
 # === HILFSFUNKTIONEN ===
+TOKEN_METADATA_PROGRAM_ID = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
+
 def load_config():
     """Lädt die Konfiguration aus der config.json-Datei."""
     try:
@@ -201,13 +207,20 @@ class SolanaTokenUI(ctk.CTk):
         self.wallet_names_map = {}
         self.auto_refresh_enabled = True
         self.refresh_interval = 30000
+        
+        # Token Info
+        self.token_name = "Token"
+        self.token_symbol = "TKN"
+        self.TOKEN_DECIMALS = 9
+        self.has_mint_authority = True
+        self.has_freeze_authority = True
 
         if not self._initialize_backend():
             self.after(100, self.destroy)
             return
         
         # UI
-        self.title("Solana Token Manager")
+        self.title(f"{self.token_name} ({self.token_symbol}) - Token Manager")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         ctk.set_appearance_mode("Dark")
@@ -239,9 +252,6 @@ class SolanaTokenUI(ctk.CTk):
             self.wallets['mint'] = load_keypair(wallet_folder, "mint-wallet.json")
             if not self.wallets['payer'] or not self.wallets['mint']: return False
             
-            # WICHTIG: Dezimalstellen aus der Konfiguration laden
-            self.TOKEN_DECIMALS = self.config.get('token_decimals', 9) # Fallback auf 9
-
             test_user_files = sorted([f for f in os.listdir(wallet_folder) if f.startswith("test-user-") and f.endswith(".json")])
             self.wallets['test_users'] = [load_keypair(wallet_folder, f) for f in test_user_files]
             
@@ -249,6 +259,9 @@ class SolanaTokenUI(ctk.CTk):
             for i, user_kp in enumerate(self.wallets['test_users']):
                 self.wallet_names_map[f"Nutzer {i+1}"] = user_kp.pubkey()
             
+            # Lade Token-Info initial, blockiert kurz die UI, aber ist für den Start notwendig.
+            self._fetch_token_and_authority_info()
+
             return True
         except Exception as e:
             show_error(self, "Initialisierungsfehler", f"Ein kritischer Fehler ist aufgetreten:\n\n{e}")
@@ -273,12 +286,12 @@ class SolanaTokenUI(ctk.CTk):
         self.main_content_frame.grid_columnconfigure(0, weight=1)
         self._create_action_tabs()
         self._create_log_area()
+        self._update_authority_widgets()
 
     def _create_status_header(self):
         header_frame = ctk.CTkFrame(self.status_frame, fg_color="transparent")
         header_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
         header_frame.grid_columnconfigure(0, weight=1)
-        # font parameter removed for scaling compatibility
         ctk.CTkLabel(header_frame, text=f"{DesignSystem.ICONS['wallet']} Wallet Status").grid(row=0, column=0, sticky="w")
         button_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         button_frame.grid(row=0, column=1, sticky="e")
@@ -309,34 +322,37 @@ class SolanaTokenUI(ctk.CTk):
     def _create_issuer_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
         # Token-Versorgung
-        supply_frame = ctk.CTkFrame(tab, corner_radius=DesignSystem.RADIUS['md'])
-        supply_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
-        supply_frame.grid_columnconfigure(1, weight=1)
-        # font parameter removed for scaling compatibility
-        ctk.CTkLabel(supply_frame, text=f"{DesignSystem.ICONS['token']} Token-Versorgung verwalten").grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
-        ctk.CTkLabel(supply_frame, text="Neue Tokens erstellen:").grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-        self.mint_amount_entry = ctk.CTkEntry(supply_frame, placeholder_text="Anzahl Tokens", width=200)
+        self.supply_frame = ctk.CTkFrame(tab, corner_radius=DesignSystem.RADIUS['md'])
+        self.supply_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
+        self.supply_frame.grid_columnconfigure(1, weight=1)
+        self.supply_title_label = ctk.CTkLabel(self.supply_frame, text=f"{DesignSystem.ICONS['token']} {self.token_name}-Versorgung verwalten")
+        self.supply_title_label.grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
+        self.mint_label = ctk.CTkLabel(self.supply_frame, text=f"Neue {self.token_symbol} erstellen:")
+        self.mint_label.grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        self.mint_amount_entry = ctk.CTkEntry(self.supply_frame, placeholder_text=f"Anzahl {self.token_symbol}", width=200)
         self.mint_amount_entry.grid(row=1, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-        self.mint_button = ctk.CTkButton(supply_frame, text=f"{DesignSystem.ICONS['mint']} Mint", command=self.on_mint, fg_color=DesignSystem.COLORS['success'])
+        self.mint_button = ctk.CTkButton(self.supply_frame, text=f"{DesignSystem.ICONS['mint']} Mint", command=self.on_mint, fg_color=DesignSystem.COLORS['success'])
         self.mint_button.grid(row=1, column=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
-        ctk.CTkLabel(supply_frame, text="Tokens vernichten:").grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-        self.burn_amount_entry = ctk.CTkEntry(supply_frame, placeholder_text="Anzahl Tokens", width=200)
+        self.burn_label = ctk.CTkLabel(self.supply_frame, text=f"{self.token_symbol} vernichten:")
+        self.burn_label.grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+        self.burn_amount_entry = ctk.CTkEntry(self.supply_frame, placeholder_text=f"Anzahl {self.token_symbol}", width=200)
         self.burn_amount_entry.grid(row=2, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-        self.burn_button = ctk.CTkButton(supply_frame, text=f"{DesignSystem.ICONS['burn']} Burn", command=self.on_burn, fg_color=DesignSystem.COLORS['error'])
+        self.burn_button = ctk.CTkButton(self.supply_frame, text=f"{DesignSystem.ICONS['burn']} Burn", command=self.on_burn, fg_color=DesignSystem.COLORS['error'])
         self.burn_button.grid(row=2, column=2, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['sm'], DesignSystem.SPACING['md']))
         
         # Transfer & Freeze/Thaw
-        self.issuer_spl_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['token']} Token senden", self.on_spl_transfer)
+        self.issuer_spl_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['token']} {self.token_name} senden", self.on_spl_transfer)
         self.issuer_spl_widgets['frame'].grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
         self.issuer_sol_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['sol']} SOL senden", self.on_sol_transfer)
         self.issuer_sol_widgets['frame'].grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
-        self._create_freeze_thaw_frame(tab).grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
+        self.freeze_thaw_frame = self._create_freeze_thaw_frame(tab)
+        self.freeze_thaw_frame.grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
 
     def _create_transfer_frame(self, parent, title, command):
         frame = ctk.CTkFrame(parent, corner_radius=DesignSystem.RADIUS['md'])
         frame.grid_columnconfigure(1, weight=1)
-        # font parameter removed for scaling compatibility
-        ctk.CTkLabel(frame, text=title).grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
+        title_label = ctk.CTkLabel(frame, text=title)
+        title_label.grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
         ctk.CTkLabel(frame, text="An:").grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         recipient_dropdown = ctk.CTkOptionMenu(frame, values=["-"], corner_radius=DesignSystem.RADIUS['sm'], width=200)
         recipient_dropdown.grid(row=1, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
@@ -349,45 +365,35 @@ class SolanaTokenUI(ctk.CTk):
         button = ctk.CTkButton(frame, text=f"{DesignSystem.ICONS['send']} Senden", corner_radius=DesignSystem.RADIUS['sm'], command=lambda: self._handle_transfer(command, amount_entry, recipient_dropdown, external_addr_entry, button))
         button.grid(row=2, column=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
         ctk.CTkLabel(frame, text="").grid(row=4, column=0, pady=2) # Spacer
-        return {'frame': frame, 'amount': amount_entry, 'recipient': recipient_dropdown, 'external': external_addr_entry, 'button': button, 'visibility_func': on_recipient_change}
+        return {'frame': frame, 'title': title_label, 'amount': amount_entry, 'recipient': recipient_dropdown, 'external': external_addr_entry, 'button': button, 'visibility_func': on_recipient_change}
 
     def _create_freeze_thaw_frame(self, parent):
         """Erstellt den Freeze/Thaw-Bereich mit Dropdown-Menü und externer Adresseingabe."""
         frame = ctk.CTkFrame(parent, corner_radius=DesignSystem.RADIUS['md'])
         frame.grid_columnconfigure(1, weight=1)
         
-        # Titel
-        # font parameter removed for scaling compatibility
-        ctk.CTkLabel(frame, text=f"{DesignSystem.ICONS['freeze']} Token-Konto sperren/entsperren").grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
+        self.freeze_thaw_title_label = ctk.CTkLabel(frame, text=f"{DesignSystem.ICONS['freeze']} {self.token_name}-Konto sperren/entsperren")
+        self.freeze_thaw_title_label.grid(row=0, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), sticky="w")
         
-        # Auswahl des Ziels
         ctk.CTkLabel(frame, text="Wallet / Adresse:").grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
         wallet_names = list(self.wallet_names_map.keys()) + ["📝 Externe Adresse..."]
         self.freeze_thaw_wallet_selector = ctk.CTkOptionMenu(frame, values=wallet_names, corner_radius=DesignSystem.RADIUS['sm'])
         self.freeze_thaw_wallet_selector.grid(row=1, column=1, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-
-        # Eingabefeld für externe Adresse (initial versteckt)
         self.freeze_thaw_external_entry = ctk.CTkEntry(frame, placeholder_text="Externe Wallet-Adresse für ATA eingeben")
         
-        # Funktion zum Ein-/Ausblenden des Eingabefelds
         def on_selection_change(choice):
-            if choice == "📝 Externe Adresse...":
-                self.freeze_thaw_external_entry.grid(row=2, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(0, DesignSystem.SPACING['sm']), sticky="ew")
-            else:
-                self.freeze_thaw_external_entry.grid_forget()
+            if choice == "📝 Externe Adresse...": self.freeze_thaw_external_entry.grid(row=2, column=0, columnspan=3, padx=DesignSystem.SPACING['md'], pady=(0, DesignSystem.SPACING['sm']), sticky="ew")
+            else: self.freeze_thaw_external_entry.grid_forget()
         
         self.freeze_thaw_wallet_selector.configure(command=on_selection_change)
 
-        # Segmented Button für Aktion
         self.freeze_thaw_action = ctk.CTkSegmentedButton(frame, values=[f"{DesignSystem.ICONS['freeze']} Sperren", f"{DesignSystem.ICONS['thaw']} Entsperren"], corner_radius=DesignSystem.RADIUS['sm'])
         self.freeze_thaw_action.set(f"{DesignSystem.ICONS['freeze']} Sperren")
         self.freeze_thaw_action.grid(row=3, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
         
-        # Ausführen-Button
         self.freeze_thaw_button = ctk.CTkButton(frame, text=f"{DesignSystem.ICONS['execute']} Ausführen", command=self.on_freeze_thaw, corner_radius=DesignSystem.RADIUS['sm'])
         self.freeze_thaw_button.grid(row=3, column=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
         
-        # Spacer
         ctk.CTkLabel(frame, text="").grid(row=4, column=0, pady=2)
         return frame
 
@@ -398,12 +404,11 @@ class SolanaTokenUI(ctk.CTk):
             return
         user_selection_frame = ctk.CTkFrame(tab, corner_radius=DesignSystem.RADIUS['md'])
         user_selection_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
-        # font parameter removed for scaling compatibility
         ctk.CTkLabel(user_selection_frame, text="Aktionen ausführen als:").pack(side="left", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
         user_names = [f"Nutzer {i+1}" for i in range(len(self.wallets['test_users']))]
         self.user_selector = ctk.CTkOptionMenu(user_selection_frame, values=user_names, command=self._on_user_selection_change, corner_radius=DesignSystem.RADIUS['sm'])
         self.user_selector.pack(side="left", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
-        self.user_spl_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['token']} Token senden", self.on_user_spl_transfer)
+        self.user_spl_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['token']} {self.token_name} senden", self.on_user_spl_transfer)
         self.user_spl_widgets['frame'].grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
         self.user_sol_widgets = self._create_transfer_frame(tab, f"{DesignSystem.ICONS['sol']} SOL senden", self.on_user_sol_transfer)
         self.user_sol_widgets['frame'].grid(row=2, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
@@ -413,7 +418,6 @@ class SolanaTokenUI(ctk.CTk):
         tab.grid_columnconfigure(0, weight=1)
         general_frame = ctk.CTkFrame(tab, corner_radius=DesignSystem.RADIUS['md'])
         general_frame.grid(row=0, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
-        # font parameter removed for scaling compatibility
         ctk.CTkLabel(general_frame, text=f"{DesignSystem.ICONS['settings']} Allgemeine Einstellungen").pack(padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), anchor="w")
         refresh_frame = ctk.CTkFrame(general_frame, fg_color="transparent")
         refresh_frame.pack(fill="x", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
@@ -424,7 +428,6 @@ class SolanaTokenUI(ctk.CTk):
         
         connection_frame = ctk.CTkFrame(tab, corner_radius=DesignSystem.RADIUS['md'])
         connection_frame.grid(row=1, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'], sticky="ew")
-        # font parameter removed for scaling compatibility
         ctk.CTkLabel(connection_frame, text=f"{DesignSystem.ICONS['info']} Verbindungsinformationen").pack(padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], DesignSystem.SPACING['lg']), anchor="w")
         rpc_frame = ctk.CTkFrame(connection_frame, fg_color="transparent")
         rpc_frame.pack(fill="x", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'])
@@ -437,7 +440,7 @@ class SolanaTokenUI(ctk.CTk):
         if self.wallets.get('mint'):
             mint_frame = ctk.CTkFrame(connection_frame, fg_color="transparent")
             mint_frame.pack(fill="x", padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['sm'], DesignSystem.SPACING['md']))
-            ctk.CTkLabel(mint_frame, text="Token Mint:", width=120, anchor="w").pack(side="left")
+            ctk.CTkLabel(mint_frame, text=f"{self.token_name} Mint:", width=120, anchor="w").pack(side="left")
             CopyableLabel(mint_frame, text=str(self.wallets['mint'].pubkey())).pack(side="left", fill="x", expand=True)
 
     def _create_log_area(self):
@@ -448,7 +451,6 @@ class SolanaTokenUI(ctk.CTk):
         log_header = ctk.CTkFrame(log_frame, fg_color="transparent")
         log_header.grid(row=0, column=0, sticky="ew", padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['md'], 0))
         log_header.grid_columnconfigure(0, weight=1)
-        # font parameter removed for scaling compatibility
         ctk.CTkLabel(log_header, text="📋 Transaktionsprotokoll").grid(row=0, column=0, sticky="w")
         self.log_textbox = EnhancedTextbox(log_frame)
         self.log_textbox.grid(row=1, column=0, sticky="nsew", padx=DesignSystem.SPACING['md'], pady=(DesignSystem.SPACING['sm'], DesignSystem.SPACING['md']))
@@ -508,48 +510,141 @@ class SolanaTokenUI(ctk.CTk):
 
     # === Status-Updates ===
     def start_status_refresh(self):
-        self.log(f"{DesignSystem.ICONS['refresh']} Wallet-Status wird aktualisiert...", "info")
+        self.log(f"{DesignSystem.ICONS['refresh']} Status wird aktualisiert...", "info")
         self.refresh_button.configure(state="disabled")
-        run_in_thread(self._fetch_wallet_statuses_thread)
+        run_in_thread(self._fetch_all_statuses_thread)
 
-    def _fetch_wallet_statuses_thread(self):
-        statuses, all_kps = [], [self.wallets['payer']] + self.wallets['test_users']
-        names = ["Payer/Emittent"] + [f"Nutzer {i+1}" for i in range(len(all_kps)-1)]
-        mint_pk = self.wallets['mint'].pubkey()
-        for name, kp in zip(names, all_kps):
-            status = {"name": name, "address": str(kp.pubkey())}
-            try:
-                status["sol_balance"] = format_sol_amount(self.http_client.get_balance(kp.pubkey()).value)
-                ata = get_associated_token_address(kp.pubkey(), mint_pk)
-                status["ata_address"] = str(ata)
+    def _fetch_all_statuses_thread(self):
+        """Holt alle relevanten Blockchain-Daten in einem Thread."""
+        try:
+            self._fetch_token_and_authority_info()
+            
+            statuses, all_kps = [], [self.wallets['payer']] + self.wallets['test_users']
+            names = ["Payer/Emittent"] + [f"Nutzer {i+1}" for i in range(len(all_kps)-1)]
+            mint_pk = self.wallets['mint'].pubkey()
+            
+            for name, kp in zip(names, all_kps):
+                status = {"name": name, "address": str(kp.pubkey())}
                 try:
-                    balance = self.http_client.get_token_account_balance(ata).value
-                    status["token_balance"] = format_token_amount(float(balance.ui_amount_string), self.TOKEN_DECIMALS)
-                except (SolanaRpcException, AttributeError): status["token_balance"] = format_token_amount(0, self.TOKEN_DECIMALS)
-            except Exception as e:
-                status["sol_balance"], status["token_balance"] = "Fehler", "Fehler"
-                self.log(f"Fehler beim Statusabruf für {name}: {e}", "error")
-            statuses.append(status)
-        self.after(0, self._update_status_ui, statuses)
+                    status["sol_balance"] = format_sol_amount(self.http_client.get_balance(kp.pubkey()).value)
+                    ata = get_associated_token_address(kp.pubkey(), mint_pk)
+                    status["ata_address"] = str(ata)
+                    try:
+                        balance = self.http_client.get_token_account_balance(ata).value
+                        # BUGFIX: Handle case where ui_amount_string can be None
+                        ui_amount_str = balance.ui_amount_string if balance.ui_amount_string is not None else '0'
+                        status["token_balance"] = format_token_amount(float(ui_amount_str), self.TOKEN_DECIMALS)
+                    except (SolanaRpcException, AttributeError): 
+                        status["token_balance"] = format_token_amount(0, self.TOKEN_DECIMALS)
+                except Exception as e:
+                    status["sol_balance"], status["token_balance"] = "Fehler", "Fehler"
+                    self.log(f"Fehler beim Statusabruf für {name}: {e}", "error")
+                statuses.append(status)
+            
+            self.after(0, self._update_ui_after_refresh, statuses)
+        except Exception as e:
+            self.log(f"Kritischer Fehler beim Refresh: {e}", "error")
+            self.after(0, lambda: self.refresh_button.configure(state="normal"))
 
+    def _update_ui_after_refresh(self, statuses):
+        """Aktualisiert die gesamte UI nach einem erfolgreichen Refresh."""
+        self.title(f"{self.token_name} ({self.token_symbol}) - Token Manager")
+        self._update_dynamic_labels()
+        self._update_status_ui(statuses)
+        self._update_authority_widgets()
+        self.log(f"{DesignSystem.ICONS['success']} Status-Aktualisierung abgeschlossen.", "success")
+
+
+    def _fetch_token_and_authority_info(self):
+        """Holt Token-Informationen (Name, Symbol, Authorities) von der Blockchain."""
+        mint_pubkey = self.wallets['mint'].pubkey()
+        try:
+            # Mint Account Info für Authorities und Dezimalstellen
+            mint_account_info = self.http_client.get_account_info(mint_pubkey).value
+            if mint_account_info and mint_account_info.data:
+                # BUGFIX: Die `solana-py` Bibliothek dekodiert die Daten bereits.
+                # Wir arbeiten direkt mit dem bytes-Objekt.
+                data = mint_account_info.data
+                
+                # Mint Authority (Option<Pubkey>) an Offset 0 (36 Bytes)
+                mint_authority_option = struct.unpack('<I', data[0:4])[0]
+                self.has_mint_authority = (mint_authority_option == 1)
+                
+                # Decimals an Offset 44
+                self.TOKEN_DECIMALS = struct.unpack('<B', data[44:45])[0]
+                
+                # Freeze Authority (Option<Pubkey>) an Offset 46
+                freeze_authority_option = struct.unpack('<I', data[46:50])[0]
+                self.has_freeze_authority = (freeze_authority_option == 1)
+            else:
+                self.log("Konnte Mint-Account nicht finden oder Daten sind leer.", "error")
+
+            # Metadaten für Name und Symbol
+            metadata_pda, _ = Pubkey.find_program_address(
+                [b"metadata", bytes(TOKEN_METADATA_PROGRAM_ID), bytes(mint_pubkey)],
+                TOKEN_METADATA_PROGRAM_ID
+            )
+            metadata_account_info = self.http_client.get_account_info(metadata_pda).value
+            if metadata_account_info and metadata_account_info.data:
+                # BUGFIX: Die `solana-py` Bibliothek dekodiert die Daten bereits.
+                metadata = metadata_account_info.data
+
+                # Name (String) beginnt bei Offset 65
+                name_len = struct.unpack('<I', metadata[65:69])[0]
+                name_bytes = metadata[69 : 69 + name_len]
+                self.token_name = name_bytes.decode('utf-8').strip('\x00')
+                
+                # Symbol (String) beginnt nach dem Namen
+                symbol_offset = 69 + name_len
+                symbol_len = struct.unpack('<I', metadata[symbol_offset : symbol_offset + 4])[0]
+                symbol_bytes = metadata[symbol_offset + 4 : symbol_offset + 4 + symbol_len]
+                self.token_symbol = symbol_bytes.decode('utf-8').strip('\x00')
+            else:
+                self.log("Konnte Metadaten-Account nicht finden, verwende Standardwerte.", "warning")
+
+        except Exception as e:
+            self.log(f"Fehler beim Laden der Token-Info: {e}", "error")
+            self.token_name = self.config.get("token_name", "Token")
+            self.token_symbol = self.config.get("token_symbol", "TKN")
+
+    def _update_authority_widgets(self):
+        """Aktiviert/Deaktiviert UI-Elemente basierend auf den Authorities."""
+        mint_state = "normal" if self.has_mint_authority else "disabled"
+        self.mint_amount_entry.configure(state=mint_state)
+        self.mint_button.configure(state=mint_state)
+        # Burn bleibt immer aktiv, da es die eigene Balance betrifft.
+
+        freeze_state = "normal" if self.has_freeze_authority else "disabled"
+        for widget in self.freeze_thaw_frame.winfo_children():
+            widget.configure(state=freeze_state)
+
+    def _update_dynamic_labels(self):
+        """Aktualisiert alle Labels, die den Token-Namen/Symbol verwenden."""
+        self.supply_title_label.configure(text=f"{DesignSystem.ICONS['token']} {self.token_name}-Versorgung verwalten")
+        self.mint_label.configure(text=f"Neue {self.token_symbol} erstellen:")
+        self.mint_amount_entry.configure(placeholder_text=f"Anzahl {self.token_symbol}")
+        self.burn_label.configure(text=f"{self.token_symbol} vernichten:")
+        self.burn_amount_entry.configure(placeholder_text=f"Anzahl {self.token_symbol}")
+        
+        self.issuer_spl_widgets['title'].configure(text=f"{DesignSystem.ICONS['token']} {self.token_name} senden")
+        self.user_spl_widgets['title'].configure(text=f"{DesignSystem.ICONS['token']} {self.token_name} senden")
+        self.freeze_thaw_title_label.configure(text=f"{DesignSystem.ICONS['freeze']} {self.token_name}-Konto sperren/entsperren")
+        
     def _update_status_ui(self, statuses):
         for widget in self.status_scroll_frame.winfo_children(): widget.destroy()
         for status in statuses:
             frame = ctk.CTkFrame(self.status_scroll_frame, corner_radius=DesignSystem.RADIUS['md'])
             frame.pack(fill="x", pady=(0, DesignSystem.SPACING['md']), padx=DesignSystem.SPACING['sm'])
             frame.grid_columnconfigure(0, weight=1)
-            # font parameter removed for scaling compatibility
             ctk.CTkLabel(frame, text=status['name']).grid(row=0, padx=10, pady=(10,5), sticky="w")
             ctk.CTkLabel(frame, text=f"{DesignSystem.ICONS['sol']} {status['sol_balance']} SOL").grid(row=1, padx=10, pady=2, sticky="w")
-            ctk.CTkLabel(frame, text=f"{DesignSystem.ICONS['token']} {status['token_balance']} Token").grid(row=2, padx=10, pady=2, sticky="w")
-            # font parameter removed for scaling compatibility
+            ctk.CTkLabel(frame, text=f"{DesignSystem.ICONS['token']} {status['token_balance']} {self.token_symbol}").grid(row=2, padx=10, pady=2, sticky="w")
             ctk.CTkLabel(frame, text="Wallet-Adresse:").grid(row=3, padx=10, pady=(5,0), sticky="w")
             CopyableLabel(frame, text=status['address'], max_length=35).grid(row=4, padx=10, pady=2, sticky="ew")
-            # font parameter removed for scaling compatibility
-            ctk.CTkLabel(frame, text="Token-Konto (ATA):").grid(row=5, padx=10, pady=(5,0), sticky="w")
+            ctk.CTkLabel(frame, text=f"{self.token_name}-Konto (ATA):").grid(row=5, padx=10, pady=(5,0), sticky="w")
             CopyableLabel(frame, text=status['ata_address'], max_length=35).grid(row=6, padx=10, pady=(2,10), sticky="ew")
         self.refresh_button.configure(state="normal")
-        self.log(f"{DesignSystem.ICONS['success']} Status-Aktualisierung abgeschlossen.", "success")
+        
 
     # === Transaktions-Handler ===
     def _confirm_and_send_transaction(self, instructions, signers: list[Keypair], label: str):
@@ -568,7 +663,7 @@ class SolanaTokenUI(ctk.CTk):
     def on_mint(self):
         try:
             amount = float(self.mint_amount_entry.get().replace(",", "."))
-            if ConfirmDialog.show(self, "Mint bestätigen", f"Möchten Sie {amount} neue Token erstellen?", confirm_text="Mint"):
+            if ConfirmDialog.show(self, "Mint bestätigen", f"Möchten Sie {amount} neue {self.token_name} erstellen?", confirm_text="Mint"):
                 self.mint_button.configure(state="disabled")
                 run_in_thread(self._execute_mint_thread, amount, self.mint_button)
         except ValueError: show_error(self, "Ungültige Eingabe", "Bitte eine gültige Zahl eingeben.")
@@ -576,7 +671,7 @@ class SolanaTokenUI(ctk.CTk):
     def on_burn(self):
         try:
             amount = float(self.burn_amount_entry.get().replace(",", "."))
-            if ConfirmDialog.show(self, "Burn bestätigen", f"Möchten Sie {amount} Token unwiderruflich vernichten?", confirm_text="Vernichten", danger=True):
+            if ConfirmDialog.show(self, "Burn bestätigen", f"Möchten Sie {amount} {self.token_name} unwiderruflich vernichten?", confirm_text="Vernichten", danger=True):
                 self.burn_button.configure(state="disabled")
                 run_in_thread(self._execute_burn_thread, amount, self.burn_button)
         except ValueError: show_error(self, "Ungültige Eingabe", "Bitte eine gültige Zahl eingeben.")
@@ -606,7 +701,7 @@ class SolanaTokenUI(ctk.CTk):
             action = "freeze" if DesignSystem.ICONS['freeze'] in self.freeze_thaw_action.get() else "thaw"
             action_german = "sperren" if action == "freeze" else "entsperren"
 
-            if ConfirmDialog.show(self, f"Konto {action_german}", f"Möchten Sie das Token-Konto von '{display_name}' wirklich {action_german}?", confirm_text=action_german.capitalize(), danger=(action == "freeze")):
+            if ConfirmDialog.show(self, f"Konto {action_german}", f"Möchten Sie das {self.token_name}-Konto von '{display_name}' wirklich {action_german}?", confirm_text=action_german.capitalize(), danger=(action == "freeze")):
                 self.freeze_thaw_button.configure(state="disabled")
                 run_in_thread(self._execute_freeze_thaw_thread, action, ata_pubkey, self.freeze_thaw_button)
         except Exception as e:
@@ -618,7 +713,10 @@ class SolanaTokenUI(ctk.CTk):
             recipient_choice = recipient_dropdown.get()
             if recipient_choice == "📝 Externe Adresse...":
                 if not external_addr_entry.get().strip(): raise ValueError("Externe Adresse darf nicht leer sein.")
-            if ConfirmDialog.show(self, "Transfer bestätigen", f"Möchten Sie {amount} {'Token' if 'spl' in command.__name__ else 'SOL'} an {recipient_choice} senden?", confirm_text="Senden"):
+            
+            transfer_type = self.token_name if 'spl' in command.__name__ else 'SOL'
+
+            if ConfirmDialog.show(self, "Transfer bestätigen", f"Möchten Sie {amount} {transfer_type} an {recipient_choice} senden?", confirm_text="Senden"):
                 command(amount_entry, recipient_dropdown, external_addr_entry, button)
         except ValueError as e: show_error(self, "Ungültige Eingabe", str(e))
     
@@ -647,7 +745,7 @@ class SolanaTokenUI(ctk.CTk):
         amount_lamports = int(amount * (10**self.TOKEN_DECIMALS))
         ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey())
         ix = mint_to(MintToParams(TOKEN_PROGRAM_ID, self.wallets['mint'].pubkey(), ata, self.wallets['payer'].pubkey(), amount_lamports))
-        if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} Tokens minten"):
+        if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} {self.token_name} minten"):
             self.after(0, self.start_status_refresh)
         self.after(0, lambda: button.configure(state="normal"))
 
@@ -655,7 +753,7 @@ class SolanaTokenUI(ctk.CTk):
         amount_lamports = int(amount * (10**self.TOKEN_DECIMALS))
         ata = get_associated_token_address(self.wallets['payer'].pubkey(), self.wallets['mint'].pubkey())
         ix = burn(BurnParams(TOKEN_PROGRAM_ID, ata, self.wallets['mint'].pubkey(), self.wallets['payer'].pubkey(), amount_lamports))
-        if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} Tokens verbrennen"):
+        if self._confirm_and_send_transaction([ix], [self.wallets['payer']], f"{amount} {self.token_name} verbrennen"):
             self.after(0, self.start_status_refresh)
         self.after(0, lambda: button.configure(state="normal"))
 
@@ -672,10 +770,10 @@ class SolanaTokenUI(ctk.CTk):
             source_ata = get_associated_token_address(sender_kp.pubkey(), self.wallets['mint'].pubkey())
             dest_ata = get_associated_token_address(dest_pubkey, self.wallets['mint'].pubkey())
             if self.http_client.get_account_info(dest_ata).value is None:
-                self.log("→ Ziel-Token-Konto (ATA) existiert nicht, wird automatisch erstellt.", "info")
+                self.log(f"→ {self.token_name}-Konto (ATA) existiert nicht, wird automatisch erstellt.", "info")
                 instructions.append(create_associated_token_account(sender_kp.pubkey(), dest_pubkey, self.wallets['mint'].pubkey()))
             instructions.append(spl_transfer(SplTransferParams(TOKEN_PROGRAM_ID, source_ata, dest_ata, sender_kp.pubkey(), amount_lamports)))
-            label = f"Überweise {amount} Tokens"
+            label = f"Überweise {amount} {self.token_name}"
         else: # sol
             amount_lamports = int(amount * 10**9)
             instructions.append(system_transfer(SystemTransferParams(from_pubkey=sender_kp.pubkey(), to_pubkey=dest_pubkey, lamports=amount_lamports)))
@@ -691,4 +789,3 @@ if __name__ == "__main__":
             app.mainloop()
     except Exception as e:
         messagebox.showerror("Unerwarteter Fehler", f"Ein schwerwiegender Fehler ist aufgetreten:\n\n{e}")
-
