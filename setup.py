@@ -1049,6 +1049,15 @@ class SetupUI(ctk.CTk):
         
         with open(os.path.join(wallet_folder, filename), 'w') as f:
             json.dump(list(bytes(keypair)), f)
+            
+        # TXT speichern (Hex-String)
+        hex_str = ''.join(f'{b:02x}' for b in bytes(keypair))
+        filename_txt = filename.rsplit('.', 1)[0] + '.txt'
+        path_txt = os.path.join(wallet_folder, filename_txt)
+        with open(path_txt, 'w') as f:
+            f.write(hex_str)
+            
+        
         self.log(f"   {DesignSystem.ICONS['success']} Wallet gespeichert: {truncate_address(str(keypair.pubkey()))}", "success")
         return keypair
 
