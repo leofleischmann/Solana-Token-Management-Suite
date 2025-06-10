@@ -1,18 +1,18 @@
-# === requirements_improved.txt: Aktualisierte Abhängigkeiten für verbesserte UI ===
+# === requirements.txt ===
 
-# Solana-Bibliotheken (Original)
-solana>=0.32.0,<0.33.0
-solders>=0.19.0,<0.20.0
-spl-token>=0.6.0,<0.7.0
-mpl-token-metadata>=0.2.0,<0.3.0
+# --- Solana Core Libraries ---
+# Für die Interaktion mit der Solana-Blockchain, Transaktionen und Tokens.
+solana==0.36.6
+solders==0.26.0
+borsh-construct==0.1.0  # Wird in setup.py zur Serialisierung von Metadaten verwendet.
 
-# UI-Bibliotheken (Neu hinzugefügt)
-customtkinter>=5.2.0
-darkdetect>=0.8.0
+# --- Graphical User Interface (GUI) ---
+# Für die Erstellung der Benutzeroberfläche mit CustomTkinter.
+customtkinter==5.2.2
+darkdetect==0.8.0       # Wird von customtkinter zur automatischen Erkennung des Dark/Light-Modus verwendet.
+Pillow==10.4.0          # Wird in setup.py zur Bildverarbeitung (Token-Icon) benötigt.
 
-# WebSocket-Unterstützung für Monitor
-websockets>=11.0.0
-
-# Optional: Für erweiterte Funktionen
-pillow>=9.0.0  # Für Bildverarbeitung in UI
-
+# --- Utilities & Networking ---
+# Für HTTP-Anfragen (Pinata) und WebSocket-Verbindungen (Whitelist-Monitor).
+requests==2.32.3
+websockets==15.0
