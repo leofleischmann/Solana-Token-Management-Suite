@@ -37,7 +37,7 @@ Dieses Projekt besteht aus drei Hauptkomponenten:
 
 1.  **Repository klonen:**
     ```bash
-    git clone [https://github.com/leofleischmann/Solana-Token-Management-Suite.git](https://github.com/leofleischmann/Solana-Token-Management-Suite.git)
+    git clone https://github.com/leofleischmann/Solana-Token-Management-Suite.git
     cd Solana-Token-Management-Suite
     ```
 
