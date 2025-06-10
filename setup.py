@@ -1,24 +1,214 @@
 #!/usr/bin/env python3
-# === setup_ui_improved.py: Verbesserte grafische Benutzeroberfläche für das Solana Setup-Skript ===
-# Version mit `isMutable`-Option für Metadaten
+# === setup.py: Solana Environment Setup als einzelne Datei ===
+# Finale Version: Implementiert die erweiterte Borsh-Struktur und korrigiert
+# die booleschen Werte sowie die Account-Liste, um den "String is the wrong size"-Fehler endgültig zu beheben.
+# Update: Token-Beschreibung über UI anpassbar gemacht.
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
 import threading
 import queue
 import time
 import os
 import sys
 import json
-from typing import Dict, List, Optional, Tuple
+import webbrowser
+from typing import Dict, List, Optional, Tuple, Callable
 
-# Import der gemeinsamen UI-Komponenten
-from ui_components import (
-    DesignSystem, StatusIndicator, CopyableLabel, ProgressDialog, 
-    ConfirmDialog, EnhancedTextbox, show_error, show_info, run_in_thread,
-    format_sol_amount, format_token_amount, truncate_address
-)
+# =================================================================================
+# === Integrierte UI-Komponenten (ehemals ui_components.py) ===
+# =================================================================================
+
+class DesignSystem:
+    """Zentrale Konfiguration für das UI-Design."""
+    COLORS = {
+        "primary": "#2FA85F",
+        "primary_hover": "#288F51",
+        "background": "#242424",
+        "foreground": "#2D2D2D",
+        "text": "#FFFFFF",
+        "text_secondary": "#B0B0B0",
+        "success": "#28A745",
+        "success_hover": "#218838",
+        "error": "#DC3545",
+        "error_hover": "#C82333",
+        "warning": "#FFC107",
+        "info": "#17A2B8",
+        "log_header": "#00A0D2",
+    }
+    SPACING = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
+    RADIUS = {"sm": 4, "md": 8, "lg": 12}
+    ICONS = {
+        "settings": "⚙️", "start": "▶️", "wallet": "💼", "token": "�",
+        "info": "ℹ️", "success": "✅", "error": "❌", "warning": "⚠️",
+        "clipboard": "📋", "link": "🔗", "spinner": "⏳"
+    }
+
+class StatusIndicator(ctk.CTkFrame):
+    """Ein UI-Element zur Anzeige eines Status mit Icon und Text."""
+    def __init__(self, master, status="unknown", text=""):
+        super().__init__(master, fg_color="transparent")
+        self.status_icon = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=14))
+        self.status_icon.pack(side="left", padx=(0, DesignSystem.SPACING['sm']))
+        self.status_label = ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=12))
+        self.status_label.pack(side="left")
+        self.set_status(status, text)
+
+    def set_status(self, status, text):
+        icon_map = {
+            "success": DesignSystem.ICONS['success'],
+            "error": DesignSystem.ICONS['error'],
+            "warning": DesignSystem.ICONS['warning'],
+            "info": DesignSystem.ICONS['info'],
+            "loading": DesignSystem.ICONS['spinner'],
+            "unknown": "❔"
+        }
+        color_map = {
+            "success": DesignSystem.COLORS['success'],
+            "error": DesignSystem.COLORS['error'],
+            "warning": DesignSystem.COLORS['warning'],
+            "info": DesignSystem.COLORS['text_secondary'],
+            "loading": DesignSystem.COLORS['info'],
+            "unknown": DesignSystem.COLORS['text_secondary']
+        }
+        self.status_icon.configure(text=icon_map.get(status, "❔"))
+        self.status_label.configure(text=text, text_color=color_map.get(status, "white"))
+
+class CopyableLabel(ctk.CTkFrame):
+    """Ein Label mit einem Button zum Kopieren des Inhalts."""
+    def __init__(self, master, text, max_length=50):
+        super().__init__(master, fg_color="transparent")
+        self.text_to_copy = text
+        
+        display_text = text
+        if len(text) > max_length:
+            display_text = text[:max_length//2 - 2] + " ... " + text[-max_length//2 + 2:]
+
+        self.label = ctk.CTkLabel(self, text=display_text, font=ctk.CTkFont(size=11), text_color=DesignSystem.COLORS['text_secondary'])
+        self.label.pack(side="left", fill="x", expand=True)
+        self.copy_button = ctk.CTkButton(self, text=DesignSystem.ICONS['clipboard'], width=30, command=self.copy_to_clipboard)
+        self.copy_button.pack(side="right", padx=(DesignSystem.SPACING['sm'], 0))
+
+    def copy_to_clipboard(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.text_to_copy)
+        self.copy_button.configure(text="✅")
+        self.after(2000, lambda: self.copy_button.configure(text=DesignSystem.ICONS['clipboard']))
+
+    def set_text(self, text, max_length=50):
+        self.text_to_copy = text
+        display_text = text
+        if len(text) > max_length:
+            display_text = text[:max_length//2 - 2] + " ... " + text[-max_length//2 + 2:]
+        self.label.configure(text=display_text)
+
+class EnhancedTextbox(ctk.CTkTextbox):
+    """Ein Textbox-Widget mit Farb-Tagging-Unterstützung."""
+    def __init__(self, master, **kwargs):
+        super().__init__(master, state="disabled", font=ctk.CTkFont(size=12, family="monospace"), **kwargs)
+        self.tag_config("success", foreground=DesignSystem.COLORS['success'])
+        self.tag_config("error", foreground=DesignSystem.COLORS['error'])
+        self.tag_config("warning", foreground=DesignSystem.COLORS['warning'])
+        self.tag_config("info", foreground=DesignSystem.COLORS['text_secondary'])
+        self.tag_config("header", foreground=DesignSystem.COLORS['log_header'])
+
+    def append_text(self, message, level="info"):
+        self.configure(state="normal")
+        self.insert("end", message + "\n", level)
+        self.configure(state="disabled")
+        self.see("end")
+
+    def clear_text(self):
+        self.configure(state="normal")
+        self.delete("1.0", "end")
+        self.configure(state="disabled")
+
+class ConfirmDialog(ctk.CTkToplevel):
+    """Ein modaler Bestätigungsdialog."""
+    def __init__(self, parent, title="Bestätigen", message="", confirm_text="OK", cancel_text="Abbrechen"):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        self.result = False
+        
+        self.message_label = ctk.CTkLabel(self, text=message, wraplength=400, justify="left", font=ctk.CTkFont(size=13))
+        self.message_label.pack(padx=20, pady=20)
+        
+        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame.pack(padx=20, pady=(0, 20), fill="x")
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.ok_button = ctk.CTkButton(button_frame, text=confirm_text, command=self.on_confirm, fg_color=DesignSystem.COLORS['success'])
+        self.ok_button.grid(row=0, column=1, padx=(10, 0))
+        
+        self.cancel_button = ctk.CTkButton(button_frame, text=cancel_text, command=self.on_cancel, fg_color=DesignSystem.COLORS['error'])
+        self.cancel_button.grid(row=0, column=0, padx=(0, 10))
+        
+        self.wait_window()
+
+    def on_confirm(self):
+        self.result = True
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = False
+        self.destroy()
+
+    @staticmethod
+    def show(parent, title, message, confirm_text="OK", cancel_text="Abbrechen"):
+        dialog = ConfirmDialog(parent, title, message, confirm_text, cancel_text)
+        return dialog.result
+
+def show_error(parent, title, message):
+    messagebox.showerror(title, message, parent=parent)
+
+def show_info(parent, title, message):
+    messagebox.showinfo(title, message, parent=parent)
+
+def run_in_thread(func: Callable):
+    """Führt eine Funktion in einem separaten Thread aus."""
+    thread = threading.Thread(target=func, daemon=True)
+    thread.start()
+
+def format_sol_amount(lamports: int) -> str:
+    """Formatiert Lamports in einen lesbaren SOL-Betrag."""
+    return f"{(lamports / 10**9):.6f} SOL"
+
+def format_token_amount(amount: float, decimals: int) -> str:
+    """Formatiert einen Token-Betrag in einen lesbaren String."""
+    return f"{amount:,.{decimals}f}"
+
+def truncate_address(address: str, chars: int = 8) -> str:
+    """Kürzt eine Solana-Adresse zur besseren Anzeige."""
+    return f"{address[:chars]}...{address[-chars:]}"
+
+class ProgressDialog(ctk.CTkToplevel):
+    """Ein einfacher, nicht-blockierender Fortschrittsdialog."""
+    def __init__(self, parent, title="Bitte warten..."):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.on_close) # Verhindert Schließen
+
+        self.label = ctk.CTkLabel(self, text="Generiere Wallet, dies kann einen Moment dauern...")
+        self.label.pack(padx=20, pady=10)
+        self.progressbar = ctk.CTkProgressBar(self, mode="indeterminate")
+        self.progressbar.pack(padx=20, pady=(0, 20), fill="x", expand=True)
+        self.progressbar.start()
+
+    def on_close(self):
+        # Ignoriert den Schließen-Befehl
+        pass
+    
+    def close_dialog(self):
+        self.progressbar.stop()
+        self.destroy()
+
+# =================================================================================
+# === Solana-Anwendungscode ===
+# =================================================================================
 
 # --- Solana-Bibliotheken ---
 try:
@@ -66,7 +256,7 @@ except ImportError:
 # --- Hilfsfunktionen für Pinata ---
 
 def _upload_file_to_pinata(filepath: str, jwt: str, log_func) -> Optional[str]:
-    """Lädt eine beliebige Datei zu Pinata hoch und gibt die IPFS-URI zurück."""
+    """Lädt eine beliebige Datei zu Pinata hoch und gibt die HTTP-Gateway-URL zurück."""
     log_func(f"   → Lade Datei hoch: {os.path.basename(filepath)}...", "info")
     if not os.path.exists(filepath):
         log_func(f"   ❌ Fehler: Datei nicht gefunden unter {filepath}", "error")
@@ -89,7 +279,7 @@ def _upload_file_to_pinata(filepath: str, jwt: str, log_func) -> Optional[str]:
         if not ipfs_hash:
             raise ValueError("Antwort von Pinata enthielt keinen IPFS-Hash.")
         
-        uri = f"ipfs://{ipfs_hash}"
+        uri = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
         log_func(f"   ✅ Datei hochgeladen! URI: {uri}", "success")
         return uri
     except Exception as e:
@@ -97,7 +287,7 @@ def _upload_file_to_pinata(filepath: str, jwt: str, log_func) -> Optional[str]:
         return None
 
 def _upload_json_to_pinata(json_data: dict, filename: str, jwt: str, log_func) -> Optional[str]:
-    """Lädt ein JSON-Objekt zu Pinata hoch und gibt die IPFS-URI zurück."""
+    """Lädt ein JSON-Objekt zu Pinata hoch und gibt die HTTP-Gateway-URL zurück."""
     log_func(f"   → Lade JSON-Metadaten hoch: {filename}...", "info")
     headers = {"Authorization": f"Bearer {jwt}"}
     payload = {
@@ -112,7 +302,7 @@ def _upload_json_to_pinata(json_data: dict, filename: str, jwt: str, log_func) -
         if not ipfs_hash:
             raise ValueError("Antwort von Pinata enthielt keinen IPFS-Hash.")
         
-        uri = f"ipfs://{ipfs_hash}"
+        uri = f"https://gateway.pinata.cloud/ipfs/{ipfs_hash}"
         log_func(f"   ✅ JSON-Metadaten hochgeladen! URI: {uri}", "success")
         return uri
     except Exception as e:
@@ -162,6 +352,7 @@ class SetupConfig:
         self.create_metadata = False
         self.token_name = ""
         self.token_symbol = ""
+        self.token_description = "" # NEU
         self.token_image_path = ""
         self.token_uri = ""
         self.pinata_jwt = ""
@@ -193,8 +384,18 @@ class SetupConfig:
         if self.create_metadata:
             if not self.token_name.strip():
                 return False, "Token-Name ist für Metadaten erforderlich."
+            if len(self.token_name.strip().encode('utf-8')) > 32:
+                return False, f"Token-Name ist zu lang. Maximal 32 Bytes erlaubt (aktuell: {len(self.token_name.strip().encode('utf-8'))})."
+
             if not self.token_symbol.strip():
                 return False, "Token-Symbol ist für Metadaten erforderlich."
+            if len(self.token_symbol.strip().encode('utf-8')) > 10:
+                return False, f"Token-Symbol ist zu lang. Maximal 10 Bytes erlaubt (aktuell: {len(self.token_symbol.strip().encode('utf-8'))})."
+            
+            # NEU: Validierung für Beschreibung
+            if len(self.token_description.strip().encode('utf-8')) > 200:
+                return False, f"Token-Beschreibung ist zu lang. Maximal 200 Bytes erlaubt (aktuell: {len(self.token_description.strip().encode('utf-8'))})."
+
             if not self.pinata_jwt.strip():
                 return False, "Pinata JWT Token ist für Metadaten erforderlich."
 
@@ -220,6 +421,11 @@ class SetupConfig:
         
         if self.create_metadata:
             summary.append(f"Metadaten: {self.token_name} ({self.token_symbol})")
+            # NEU: Beschreibung zur Zusammenfassung hinzugefügt
+            desc_preview = self.token_description.strip()[:50] + '...' if len(self.token_description.strip()) > 50 else self.token_description.strip()
+            if desc_preview:
+                summary.append(f"Beschreibung: \"{desc_preview}\"")
+
             img_status = os.path.basename(self.token_image_path) if self.token_image_path else "Platzhalterbild"
             summary.append(f"Token-Bild: {img_status}")
             mutable_status = "Ja (änderbar)" if self.is_mutable else "Nein (final)"
@@ -236,7 +442,7 @@ class SetupUI(ctk.CTk):
         super().__init__()
         
         # --- UI-Konfiguration ---
-        self.title("Solana Environment Setup - Automatische Metadaten")
+        self.title("Solana Environment Setup - Einzelne Datei")
         self.geometry("1000x800")
         self.minsize(900, 700)
         
@@ -437,11 +643,15 @@ class SetupUI(ctk.CTk):
         self.pinata_jwt_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Pinata JWT Token hier einfügen", show="*")
         self.pinata_jwt_entry.bind("<KeyRelease>", self._on_config_change)
         
-        self.token_name_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Name (z.B. 'My Token')")
+        self.token_name_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Name (max. 32 Bytes)")
         self.token_name_entry.bind("<KeyRelease>", self._on_config_change)
         
-        self.token_symbol_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Symbol (z.B. 'MTK')")
+        self.token_symbol_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Symbol (max. 10 Bytes)")
         self.token_symbol_entry.bind("<KeyRelease>", self._on_config_change)
+
+        # NEU: Eingabefeld für die Beschreibung
+        self.token_description_entry = ctk.CTkEntry(self.metadata_fields_container, placeholder_text="Token Beschreibung (optional, max. 200 Bytes)")
+        self.token_description_entry.bind("<KeyRelease>", self._on_config_change)
         
         self.select_image_button = ctk.CTkButton(self.metadata_fields_container, text="Token-Bild auswählen...", command=self._select_token_image)
         self.selected_image_label = ctk.CTkLabel(self.metadata_fields_container, text="Kein Bild ausgewählt", font=ctk.CTkFont(size=10), text_color="gray")
@@ -519,17 +729,24 @@ class SetupUI(ctk.CTk):
         self._on_config_change()
 
     def _toggle_metadata(self):
+        row_counter = 0
         if self.metadata_check.get():
-            self.pinata_jwt_entry.grid(row=0, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-            self.token_name_entry.grid(row=1, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-            self.token_symbol_entry.grid(row=2, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew")
-            self.select_image_button.grid(row=3, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-            self.selected_image_label.grid(row=3, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
-            self.is_mutable_check.grid(row=4, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+            self.pinata_jwt_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
+            self.token_name_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
+            self.token_symbol_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
+            # NEU: Beschreibung anzeigen
+            self.token_description_entry.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="ew"); row_counter += 1
+            
+            self.select_image_button.grid(row=row_counter, column=0, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w")
+            self.selected_image_label.grid(row=row_counter, column=1, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w"); row_counter += 1
+            
+            self.is_mutable_check.grid(row=row_counter, column=0, columnspan=2, padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['sm'], sticky="w"); row_counter += 1
         else:
             self.pinata_jwt_entry.grid_forget()
             self.token_name_entry.grid_forget()
             self.token_symbol_entry.grid_forget()
+            # NEU: Beschreibung ausblenden
+            self.token_description_entry.grid_forget()
             self.select_image_button.grid_forget()
             self.selected_image_label.grid_forget()
             self.is_mutable_check.grid_forget()
@@ -547,13 +764,11 @@ class SetupUI(ctk.CTk):
             return
 
         # --- Bildvalidierung ---
-        # 1. Dateigröße prüfen (max 100KB)
         file_size_kb = os.path.getsize(filepath) / 1024
         if file_size_kb > 100:
             show_error(self, "Ungültiges Bild", f"Die Dateigröße ({file_size_kb:.1f} KB) überschreitet das Limit von 100 KB.")
             return
 
-        # 2. Dimensionen prüfen
         try:
             with Image.open(filepath) as img:
                 width, height = img.size
@@ -564,7 +779,6 @@ class SetupUI(ctk.CTk):
             show_error(self, "Bildfehler", f"Das Bild konnte nicht gelesen oder verarbeitet werden:\n{e}")
             return
 
-        # Wenn alles ok ist:
         self.setup_config.token_image_path = filepath
         self.selected_image_label.configure(text=os.path.basename(filepath))
         self._on_config_change()
@@ -598,6 +812,8 @@ class SetupUI(ctk.CTk):
         if cfg.create_metadata:
             cfg.token_name = self.token_name_entry.get().strip()
             cfg.token_symbol = self.token_symbol_entry.get().strip()
+            # NEU: Beschreibung aus UI lesen
+            cfg.token_description = self.token_description_entry.get().strip()
             cfg.pinata_jwt = self.pinata_jwt_entry.get().strip()
             cfg.is_mutable = bool(self.is_mutable_check.get())
         # cfg.token_image_path wird direkt in _select_token_image gesetzt
@@ -628,7 +844,6 @@ class SetupUI(ctk.CTk):
             show_error(self, "Konfigurationsfehler", error_msg)
             return
         
-        # Speichere den JWT in der Konfiguration, bevor das Setup startet
         if self.setup_config.create_metadata and self.setup_config.pinata_jwt:
             self.config['pinata_jwt'] = self.setup_config.pinata_jwt
             self._save_config()
@@ -759,7 +974,8 @@ class SetupUI(ctk.CTk):
         metadata_json = {
             "name": self.setup_config.token_name,
             "symbol": self.setup_config.token_symbol,
-            "description": f"Ein mit dem Setup-Tool erstellter Token.",
+            # NEU: Beschreibung aus der Konfiguration verwenden
+            "description": self.setup_config.token_description or "Ein mit dem Setup-Tool erstellter Token.",
             "image": image_uri,
             "attributes": []
         }
@@ -771,7 +987,7 @@ class SetupUI(ctk.CTk):
         if not final_uri:
             raise Exception("Konnte Metadaten-URI von Pinata nicht abrufen. Breche ab.")
         
-        self.setup_config.token_uri = final_uri # Wichtig: URI in der Konfig speichern
+        self.setup_config.token_uri = final_uri
 
         # 4. On-Chain-Metadaten-Instruktion erstellen und senden
         instruction = self._create_metadata_instruction_manually()
@@ -883,16 +1099,11 @@ class SetupUI(ctk.CTk):
             self.log(f"{DesignSystem.ICONS['success']} Ausreichend Guthaben vorhanden.", "success")
     
     def _create_metadata_instruction_manually(self) -> Instruction:
-        """
-        Erstellt die `CreateMetadataAccountV3`-Instruktion manuell mittels borsh-construct.
-        """
-        self.log("→ Erstelle On-Chain Metadaten-Instruktion...", "info")
+        self.log("→ Erstelle On-Chain Metadaten-Instruktion (finale Methode)...", "info")
 
         token_metadata_program = Pubkey.from_string("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
         system_program = Pubkey.from_string('11111111111111111111111111111111')
         
-        CollectionDetails = Enum("V1" / CStruct("size" / U64), enum_name="CollectionDetails")
-
         instruction_structure = CStruct(
             "instructionDiscriminator" / U8,
             "createMetadataAccountArgsV3" / CStruct(
@@ -901,15 +1112,26 @@ class SetupUI(ctk.CTk):
                     "symbol" / String,
                     "uri" / String,
                     "sellerFeeBasisPoints" / U16,
-                    "creators" / Option(Vec(CStruct("address" / Bytes(32), "verified" / Bool, "share" / U8))),
-                    "collection" / Option(CStruct("verified" / Bool, "key" / Bytes(32))),
-                    "uses" / Option(CStruct("useMethod" / Enum("Burn", "Multiple", "Single", enum_name="UseMethod"), "remaining" / U64, "total" / U64))
+                    "creators" / Option(Vec(CStruct(
+                        "address" / Bytes(32),
+                        "verified" / Bool,
+                        "share" / U8
+                    ))),
+                    "collection" / Option(CStruct(
+                        "verified" / Bool,
+                        "key" / Bytes(32)
+                    )),
+                    "uses" / Option(CStruct(
+                        "useMethod" / Enum("Burn", "Multiple", "Single", enum_name="UseMethod"),
+                        "remaining" / U64,
+                        "total" / U64
+                    ))
                 ),
                 "isMutable" / Bool,
-                "collectionDetails" / Option(CollectionDetails)
+                "collectionDetails" / Option(Enum("V1" / CStruct("size" / U64), enum_name="CollectionDetails"))
             )
         )
-
+        
         instruction_data = {
             "instructionDiscriminator": 33,
             "createMetadataAccountArgsV3": {
@@ -918,11 +1140,17 @@ class SetupUI(ctk.CTk):
                     "symbol": self.setup_config.token_symbol,
                     "uri": self.setup_config.token_uri,
                     "sellerFeeBasisPoints": 0,
-                    "creators": [{"address": bytes(self.payer_kp.pubkey()), "verified": True, "share": 100}],
+                    "creators": [
+                        {
+                            "address": bytes(self.payer_kp.pubkey()),
+                            "verified": 1,
+                            "share": 100
+                        }
+                    ],
                     "collection": None,
                     "uses": None
                 },
-                "isMutable": self.setup_config.is_mutable,
+                "isMutable": 1 if self.setup_config.is_mutable else 0,
                 "collectionDetails": None
             }
         }
@@ -936,9 +1164,9 @@ class SetupUI(ctk.CTk):
         accounts = [
             AccountMeta(pubkey=metadata_pda, is_signer=False, is_writable=True),
             AccountMeta(pubkey=self.mint_kp.pubkey(), is_signer=False, is_writable=False),
-            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=False),
-            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=True),
-            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=False, is_writable=False),
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=False), # Mint Authority
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=True, is_writable=True),  # Payer
+            AccountMeta(pubkey=self.payer_kp.pubkey(), is_signer=False, is_writable=False), # Update Authority
             AccountMeta(pubkey=system_program, is_signer=False, is_writable=False),
         ]
 
@@ -955,14 +1183,15 @@ class SetupUI(ctk.CTk):
             self.mint_prefix_entry, self.test_user_slider, self.test_user_vanity_check, 
             self.test_user_prefix_entry, self.initial_mint_entry, self.sol_for_users_entry,
             self.metadata_check, self.pinata_jwt_entry, self.token_name_entry, 
-            self.token_symbol_entry, self.select_image_button, self.is_mutable_check
+            self.token_symbol_entry, self.token_description_entry, # NEU
+            self.select_image_button, self.is_mutable_check
         ]
         for widget in widgets_to_toggle:
             try: widget.configure(state=state)
             except: pass
 
     def _setup_completed(self):
-        self.after(0, self._check_for_existing_setup) # Refresh UI to show "already configured"
+        self.after(0, self._check_for_existing_setup) 
         mint_address = str(self.mint_kp.pubkey())
         explorer_url = f"https://explorer.solana.com/address/{mint_address}?cluster=devnet"
         self.log(f"🔗 Token Explorer Link: {explorer_url}", "info")
@@ -1019,22 +1248,22 @@ class SetupUI(ctk.CTk):
             except: self.connection_status.set_status("error", "Verbindung fehlgeschlagen")
             
             self._check_for_existing_setup()
-            self._toggle_metadata() # Initial state for metadata fields
-            self._on_config_change() # Initial preview update
+            self._toggle_metadata() 
+            self._on_config_change() 
         except Exception as e:
             show_error(self, "Config Fehler", f"config.json konnte nicht geladen werden: {e}")
             self.connection_status.set_status("error", "Konfiguration fehlt")
 
     def _check_for_existing_setup(self):
         wallet_folder = self.config.get("wallet_folder")
-        if not wallet_folder: return
+        if not wallet_folder or not os.path.exists(wallet_folder): return
         
         payer_path = os.path.join(wallet_folder, "payer-wallet.json")
         mint_path = os.path.join(wallet_folder, "mint-wallet.json")
 
         if os.path.exists(payer_path) and os.path.exists(mint_path):
             self.setup_exists = True
-            self.scroll_frame.grid_forget() # Hide config options
+            self.scroll_frame.grid_forget() 
             
             self.existing_setup_frame.grid(row=1, column=0, sticky="nsew", padx=DesignSystem.SPACING['md'], pady=DesignSystem.SPACING['md'])
             self.existing_setup_frame.grid_columnconfigure(0, weight=1)
@@ -1054,7 +1283,7 @@ class SetupUI(ctk.CTk):
                 CopyableLabel(status_frame, text=mint_address, max_length=100).pack(fill="x", padx=10, pady=(0, 10))
                 
                 ctk.CTkLabel(status_frame, text="Solana Explorer Link:", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
-                CopyableLabel(status_frame, text=explorer_url, max_length=100).pack(fill="x", padx=10, pady=(0, 10))
+                ctk.CTkButton(status_frame, text="Im Explorer öffnen", command=lambda u=explorer_url: webbrowser.open(u)).pack(fill="x", padx=10, pady=(0, 10))
 
             except Exception as e:
                 ctk.CTkLabel(status_frame, text=f"Fehler beim Laden der Wallet-Infos: {e}", text_color="red").pack(padx=10, pady=10)
@@ -1064,10 +1293,5 @@ class SetupUI(ctk.CTk):
 
 
 if __name__ == "__main__":
-    # Überprüfen, ob die Hilfsdateien existieren
-    if not os.path.exists("ui_components.py"):
-        messagebox.showerror("Fehlende Dateien", "Stellen Sie sicher, dass 'ui_components.py' im selben Ordner wie 'setup.py' liegt.")
-        sys.exit(1)
-        
     app = SetupUI()
     app.mainloop()
