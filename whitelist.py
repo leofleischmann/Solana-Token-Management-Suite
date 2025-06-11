@@ -266,19 +266,49 @@ class WhitelistMonitorBot:
             if self.debug_mode: self.log_func(f"DEBUG: Signatur {signature_str} bereits verarbeitet. Überspringe.", "debug")
             return
 
+        tx_resp_value = None 
         try:
             if self.debug_mode: self.log_func(f"DEBUG: Hole Transaktion für Signatur: {signature_str}", "debug")
             sig = Signature.from_string(signature_str)
-            tx_resp = await self.async_http_client.get_transaction(sig, max_supported_transaction_version=0, encoding="jsonParsed")
-            if not tx_resp or not tx_resp.value or not tx_resp.value.transaction:
-                if self.debug_mode: self.log_func(f"DEBUG: Keine gültige Transaktion für {signature_str}.", "debug"); return
-            if tx_resp.value.transaction.meta and tx_resp.value.transaction.meta.err:
-                if self.debug_mode: self.log_func(f"DEBUG: Transaktion {signature_str} mit Fehler: {tx_resp.value.transaction.meta.err}.", "debug"); return
-            if self.debug_mode: self.log_func(f"DEBUG: Transaktion {signature_str} erfolgreich geholt.", "debug")
-        except Exception as e:
-            if self.debug_mode: self.log_func(f"DEBUG: Fehler beim Holen der Transaktion {signature_str}: {e}", "debug"); return
+            tx_resp_http = await asyncio.wait_for( # Renamed to avoid confusion
+                self.async_http_client.get_transaction(sig, max_supported_transaction_version=0, encoding="jsonParsed"),
+                timeout=15.0 
+            )
+            
+            if not tx_resp_http:
+                if self.debug_mode: self.log_func(f"DEBUG: Keine Antwort (tx_resp_http is None) für {signature_str} erhalten.", "debug")
+                return
 
-        tx_meta = tx_resp.value.transaction.meta
+            tx_resp_value = tx_resp_http.value 
+
+            if not tx_resp_value:
+                if self.debug_mode: self.log_func(f"DEBUG: tx_resp_value ist None für {signature_str}.", "debug")
+                return
+            
+            if not hasattr(tx_resp_value, 'transaction') or not tx_resp_value.transaction:
+                if self.debug_mode: self.log_func(f"DEBUG: tx_resp_value.transaction ist None oder fehlt für {signature_str}. tx_resp_value: {tx_resp_value}", "debug")
+                return
+
+            if not hasattr(tx_resp_value.transaction, 'meta') or not tx_resp_value.transaction.meta:
+                 if self.debug_mode: self.log_func(f"DEBUG: tx_resp_value.transaction.meta ist None oder fehlt für {signature_str}. tx_resp_value.transaction: {tx_resp_value.transaction}", "debug")
+                 return
+
+            if tx_resp_value.transaction.meta.err:
+                if self.debug_mode: self.log_func(f"DEBUG: Transaktion {signature_str} hat einen Fehler im Meta: {tx_resp_value.transaction.meta.err}. Überspringe.", "debug")
+                return
+                
+            if self.debug_mode: self.log_func(f"DEBUG: Transaktion {signature_str} erfolgreich geholt und grundlegend validiert.", "debug")
+        
+        except asyncio.TimeoutError:
+            self.log_func(f"WARNUNG: Timeout beim Holen der Transaktion {signature_str}.", "warning")
+            return
+        except Exception as e:
+            self.log_func(f"FEHLER: Unerwarteter Fehler beim Holen/Validieren der Transaktion {signature_str}: {e}", "error")
+            if self.debug_mode: import traceback; self.log_func(traceback.format_exc(), "debug")
+            return
+
+        tx_meta = tx_resp_value.transaction.meta 
+        
         has_mint_in_balances = any(
             hasattr(b, 'mint') and isinstance(b.mint, Pubkey) and b.mint == self.mint_pubkey
             for b in (getattr(tx_meta, 'pre_token_balances', []) or []) + (getattr(tx_meta, 'post_token_balances', []) or [])
@@ -291,14 +321,14 @@ class WhitelistMonitorBot:
              self.log_func(f"DEBUG: Post-Token Balances Mints: {[str(b.mint) if hasattr(b, 'mint') else 'N/A' for b in post_b]}", "debug")
 
         has_mint_in_instructions = False
-        if tx_resp.value.transaction.transaction.message.instructions:
-            for instruction_obj in tx_resp.value.transaction.transaction.message.instructions: # Umbenannt zu instruction_obj
+        if tx_resp_value.transaction.transaction.message.instructions:
+            for instruction_obj in tx_resp_value.transaction.transaction.message.instructions: 
                 instruction_mint_str = None
-                if hasattr(instruction_obj, 'parsed') and instruction_obj.parsed: # Für solders.ParsedInstruction
+                if hasattr(instruction_obj, 'parsed') and instruction_obj.parsed: 
                     parsed_content = instruction_obj.parsed
                     if hasattr(parsed_content, 'info') and hasattr(getattr(parsed_content, 'info', None), 'mint'):
                         instruction_mint_str = str(getattr(getattr(parsed_content, 'info'), 'mint', ''))
-                elif isinstance(instruction_obj, dict) and 'parsed' in instruction_obj: # Fallback für reine Dictionary-Struktur
+                elif isinstance(instruction_obj, dict) and 'parsed' in instruction_obj: 
                     info = instruction_obj.get('parsed', {}).get('info', {})
                     instruction_mint_str = info.get('mint')
 
@@ -306,9 +336,9 @@ class WhitelistMonitorBot:
                     has_mint_in_instructions = True; break
         
         if self.debug_mode: self.log_func(f"DEBUG: has_mint_in_instructions: {has_mint_in_instructions} für {signature_str}", "debug")
-        if self.debug_mode and not has_mint_in_instructions and tx_resp.value.transaction.transaction.message.instructions: 
+        if self.debug_mode and not has_mint_in_instructions and tx_resp_value.transaction.transaction.message.instructions: 
              instr_mints = []
-             for instr in tx_resp.value.transaction.transaction.message.instructions:
+             for instr in tx_resp_value.transaction.transaction.message.instructions:
                  if hasattr(instr, 'parsed') and instr.parsed and hasattr(instr.parsed, 'info') and hasattr(getattr(instr.parsed, 'info', None), 'mint'):
                      instr_mints.append(str(getattr(getattr(instr.parsed, 'info'), 'mint')))
                  elif isinstance(instr, dict) and 'parsed' in instr:
@@ -323,22 +353,26 @@ class WhitelistMonitorBot:
         self.processed_signatures.append(signature_str); self.stats['transactions_analyzed'] += 1
         self.log_func(f"\n--- Analyse: {signature_str[:30]}... ---", "header")
         
-        transfer_logged = self._log_transfer_if_present(tx_resp, signature_str)
-        freeze_thaw_logged = await self._log_freeze_thaw_if_present(tx_resp, signature_str) 
+        transfer_logged = self._log_transfer_if_present(tx_resp_value, signature_str) 
+        freeze_thaw_logged = await self._log_freeze_thaw_if_present(tx_resp_value, signature_str) 
 
         if not transfer_logged and not freeze_thaw_logged: 
             self.log_func("→ Keine relevante Aktion für diesen Token gefunden (z.B. Transfer anderer Tokens).", "info")
         self.log_func("------------------------------------------", "header")
 
-    def _log_transfer_if_present(self, tx_resp, signature_str: str) -> bool:
+    def _log_transfer_if_present(self, tx_response_value, signature_str: str) -> bool: # Parameter umbenannt
         if self.debug_mode: self.log_func(f"DEBUG: _log_transfer_if_present für {signature_str}", "debug")
-        tx_meta = tx_resp.value.transaction.meta
-        log_entry = {'timestamp': datetime.utcnow().isoformat(), 'signature': signature_str, 'sender': None, 'recipient': None, 'amount': 0, 'status': 'UNKNOWN', 'frozen_wallets': []}
+        # tx_response_value IST BEREITS tx_resp.value
+        if not tx_response_value.transaction or not tx_response_value.transaction.meta:
+            if self.debug_mode: self.log_func(f"DEBUG (_log_transfer): transaction oder meta fehlt in tx_response_value für {signature_str}", "debug")
+            return False
+        tx_meta = tx_response_value.transaction.meta # <<< KORREKTUR
+        log_entry = {'timestamp': datetime.utcnow().isoformat(), 'signature': signature_str, 'sender': None, 'recipient': None, 'amount': 0.0, 'status': 'UNKNOWN', 'frozen_wallets': []}
         try:
-            account_keys_raw = tx_resp.value.transaction.transaction.message.account_keys
+            account_keys_raw = tx_response_value.transaction.transaction.message.account_keys # <<< KORREKTUR
             account_keys = self._extract_pubkeys_from_account_keys_raw(account_keys_raw, signature_str) 
             if not account_keys: 
-                self.log_func(f"FEHLER: Keine gültigen Account Keys für {signature_str} extrahiert. Abbruch Transfer-Analyse.", "error"); return False
+                return False 
             if self.debug_mode: self.log_func(f"DEBUG: Extrahierte Account Keys für {signature_str}: {[str(pk) for pk in account_keys]}", "debug")
 
             balance_changes = {}
@@ -351,55 +385,82 @@ class WhitelistMonitorBot:
                     if balance_obj.account_index >= len(account_keys):
                         self.log_func(f"FEHLER: account_index {balance_obj.account_index} oob für {signature_str}.", "error"); continue 
                     if owner_str not in balance_changes: balance_changes[owner_str] = {'ata': account_keys[balance_obj.account_index], 'pre': 0, 'post': 0}
+            
             for pre in pre_balances:
                 if hasattr(pre, 'owner') and str(pre.owner) in balance_changes and hasattr(pre, 'ui_token_amount') and pre.ui_token_amount.amount and hasattr(pre, 'mint') and isinstance(pre.mint, Pubkey) and pre.mint == self.mint_pubkey:
                     balance_changes[str(pre.owner)]['pre'] = int(pre.ui_token_amount.amount)
             for post in post_balances:
                 if hasattr(post, 'owner') and str(post.owner) in balance_changes and hasattr(post, 'ui_token_amount') and post.ui_token_amount.amount and hasattr(post, 'mint') and isinstance(post.mint, Pubkey) and post.mint == self.mint_pubkey:
                     balance_changes[str(post.owner)]['post'] = int(post.ui_token_amount.amount)
+
             for owner, data in balance_changes.items():
                 change = data['post'] - data['pre']
-                if change < 0: log_entry['sender'] = owner; log_entry['amount'] = abs(change) / (10**self.TOKEN_DECIMALS)
-                elif change > 0: log_entry['recipient'] = owner
-            sender, recipient = log_entry['sender'], log_entry['recipient']
-            if self.debug_mode: self.log_func(f"DEBUG: Determined Sender: {sender}, Recipient: {recipient}, Amount: {log_entry['amount']}", "debug")
-            if not sender or not recipient or log_entry['amount'] == 0:
-                if self.debug_mode: self.log_func(f"DEBUG: Kein gültiger Transfer in {signature_str}.", "debug"); return False
-            self.log_func(f"Absender:    {truncate_address(sender)}", "info"); self.log_func(f"Empfänger:   {truncate_address(recipient)}", "info"); self.log_func(f"Menge:       {log_entry['amount']} Tokens", "info")
-            if recipient in self.whitelist: self.log_func("STATUS: ✅ Empfänger ist autorisiert.", "success"); log_entry['status'] = 'AUTHORIZED'
+                if change < 0: 
+                    log_entry['sender'] = owner
+                    log_entry['amount'] = abs(change) / (10**self.TOKEN_DECIMALS)
+                elif change > 0: 
+                    log_entry['recipient'] = owner
+            
+            sender, recipient, amount = log_entry['sender'], log_entry['recipient'], log_entry['amount']
+            
+            if self.debug_mode: self.log_func(f"DEBUG: Determined Sender: {sender}, Recipient: {recipient}, Amount: {amount}", "debug")
+
+            if not sender or not recipient or not isinstance(amount, float) or amount <= 0.0:
+                if self.debug_mode: self.log_func(f"DEBUG: Kein gültiger Transfer (S, E oder Betrag ungültig/null) in {signature_str}. S: {sender}, R: {recipient}, A: {amount}", "debug")
+                return False 
+
+            self.log_func(f"Absender:    {truncate_address(sender)}", "info")
+            self.log_func(f"Empfänger:   {truncate_address(recipient)}", "info")
+            self.log_func(f"Menge:       {amount} Tokens", "info")
+
+            if recipient in self.whitelist: 
+                self.log_func("STATUS: ✅ Empfänger ist autorisiert.", "success")
+                log_entry['status'] = 'AUTHORIZED'
             else:
-                self.log_func("STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.", "error"); self.stats['violations_detected'] += 1; log_entry['status'] = 'VIOLATION_FROZEN'
+                self.log_func("STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.", "error")
+                self.stats['violations_detected'] += 1
+                log_entry['status'] = 'VIOLATION_FROZEN'
                 if self.notification_callback: self.notification_callback("Whitelist-Verstoß", f"Transfer an {truncate_address(recipient)}")
+                
                 if self.freeze_recipient_on_violation:
-                    if recipient not in balance_changes or 'ata' not in balance_changes[recipient]: self.log_func(f"FEHLER: ATA für Empfänger {recipient} nicht in balance_changes. Freeze nicht möglich.", "error")
-                    else: asyncio.create_task(self._freeze_account_on_chain(balance_changes[recipient]['ata'], recipient, "Empfänger (Verstoß)"))
+                    if recipient not in balance_changes or 'ata' not in balance_changes[recipient]: 
+                        self.log_func(f"FEHLER: ATA für Empfänger {recipient} nicht in balance_changes. Freeze nicht möglich.", "error")
+                    else: 
+                        asyncio.create_task(self._freeze_account_on_chain(balance_changes[recipient]['ata'], recipient, "Empfänger (Verstoß)"))
                     log_entry['frozen_wallets'].append(recipient)
+                    
                     if self.freeze_sender_on_violation:
                         self.log_func("→ Option 'Absender ebenfalls sperren' aktiv.", "info")
-                        if sender not in balance_changes or 'ata' not in balance_changes[sender]: self.log_func(f"FEHLER: ATA für Sender {sender} nicht in balance_changes. Freeze nicht möglich.", "error")
-                        else: asyncio.create_task(self._freeze_account_on_chain(balance_changes[sender]['ata'], sender, "Absender (Verstoß)"))
+                        if sender not in balance_changes or 'ata' not in balance_changes[sender]: 
+                            self.log_func(f"FEHLER: ATA für Sender {sender} nicht in balance_changes. Freeze nicht möglich.", "error")
+                        else: 
+                            asyncio.create_task(self._freeze_account_on_chain(balance_changes[sender]['ata'], sender, "Absender (Verstoß)"))
                         if sender not in log_entry['frozen_wallets']: log_entry['frozen_wallets'].append(sender)
-                else: self.log_func("→ Option 'Empfänger sperren' ist deaktiviert.", "warning")
+                else: 
+                    self.log_func("→ Option 'Empfänger sperren' ist deaktiviert.", "warning")
+            
             self.transaction_logger.info(json.dumps(log_entry))
-            if self.debug_mode: self.log_func(f"DEBUG: Transfer geloggt für {signature_str}", "debug"); return True
+            if self.debug_mode: self.log_func(f"DEBUG: Transfer geloggt für {signature_str}", "debug")
+            return True
         except Exception as e:
             self.log_func(f"{DesignSystem.ICONS['error']} Kritischer Fehler bei Transfer-Analyse für {signature_str}: {e}", "error")
             if self.debug_mode: import traceback; self.log_func(traceback.format_exc(), "debug") 
             return False
-        return True 
 
-    async def _log_freeze_thaw_if_present(self, tx_resp, signature_str: str) -> bool: 
+    async def _log_freeze_thaw_if_present(self, tx_response_value, signature_str: str) -> bool: # Parameter umbenannt
         if self.debug_mode: self.log_func(f"DEBUG: _log_freeze_thaw_if_present für {signature_str}", "debug")
         
-        if not hasattr(tx_resp.value.transaction.transaction.message, 'instructions') or \
-           not tx_resp.value.transaction.transaction.message.instructions:
-            if self.debug_mode: self.log_func(f"DEBUG (Freeze/Thaw Check - TX: {signature_str}): Keine Instruktionen in der Transaktion gefunden.", "debug")
+        # tx_response_value IST BEREITS tx_resp.value
+        if not tx_response_value.transaction or not tx_response_value.transaction.message or \
+           not hasattr(tx_response_value.transaction.transaction.message, 'instructions') or \
+           not tx_response_value.transaction.transaction.message.instructions:
+            if self.debug_mode: self.log_func(f"DEBUG (Freeze/Thaw Check - TX: {signature_str}): Keine Instruktionen oder notwendige Transaktionsstruktur in tx_response_value gefunden.", "debug")
             return False
             
-        instructions_list = tx_resp.value.transaction.transaction.message.instructions
+        instructions_list = tx_response_value.transaction.transaction.message.instructions # <<< KORREKTUR
         logged_something = False
         
-        account_keys_raw = tx_resp.value.transaction.transaction.message.account_keys
+        account_keys_raw = tx_response_value.transaction.transaction.message.account_keys # <<< KORREKTUR
         account_keys = self._extract_pubkeys_from_account_keys_raw(account_keys_raw, signature_str)
         if not account_keys:
             return False
@@ -409,12 +470,11 @@ class WhitelistMonitorBot:
         for instruction_idx, instruction_obj in enumerate(instructions_list): 
             program_id_str = "N/A"; parsed_instr_type = "N/A"; parsed_instr_info_dict = {}; instruction_program_id_obj = None; raw_instruction_content = "N/A"
             
-            # <<<< ANPASSUNG FÜR ParsedInstruction OBJEKTE UND VERBESSERTES DEBUGGING >>>>
             if hasattr(instruction_obj, 'program_id') and hasattr(instruction_obj, 'parsed'):
                 instruction_program_id_obj = instruction_obj.program_id 
                 program_id_str = str(instruction_program_id_obj)
                 parsed_content = instruction_obj.parsed
-                raw_instruction_content = str(instruction_obj) # Logge das Objekt selbst
+                raw_instruction_content = str(instruction_obj) 
                 if isinstance(parsed_content, dict):
                      parsed_instr_type = parsed_content.get('type', 'N/A')
                      parsed_instr_info_dict = parsed_content.get('info', {})
@@ -423,14 +483,14 @@ class WhitelistMonitorBot:
                     info_obj = getattr(parsed_content, 'info', None)
                     if info_obj:
                         try:
-                            parsed_instr_info_dict = {
-                                "account": str(getattr(info_obj, 'account', '')), "mint": str(getattr(info_obj, 'mint', '')),
-                                "owner": str(getattr(info_obj, 'owner', '')), "authority": str(getattr(info_obj, 'authority', '')),
-                                "freezeAuthority": str(getattr(info_obj, 'freeze_authority', '')),
-                            }
-                            parsed_instr_info_dict = {k: v for k, v in parsed_instr_info_dict.items() if v}
+                            fields_to_try = ['account', 'mint', 'owner', 'authority', 'freezeAuthority', 'source', 'destination', 'multisigAuthority', 'newAuthority', 'delegate']
+                            for field in fields_to_try:
+                                if hasattr(info_obj, field):
+                                    value = getattr(info_obj, field)
+                                    if value is not None: 
+                                        parsed_instr_info_dict[field] = str(value)
                         except Exception as e:
-                            if self.debug_mode: self.log_func(f"DEBUG (Freeze/Thaw): Fehler beim Extrahieren von Info-Attributen: {e}", "debug")
+                            if self.debug_mode: self.log_func(f"DEBUG (Freeze/Thaw): Fehler beim Extrahieren von Info-Attributen aus Objekt: {e}", "debug")
             elif isinstance(instruction_obj, dict):
                 program_id_str = str(instruction_obj.get('programId', 'N/A'))
                 if program_id_str != "N/A": 
@@ -448,7 +508,6 @@ class WhitelistMonitorBot:
                 self.log_func(f"RAW_INSTRUCTION_DEBUG (TX: {signature_str}, Idx: {instruction_idx}): ProgramId: {program_id_str}, ParsedType: {parsed_instr_type}, ParsedInfo: {json.dumps(parsed_instr_info_dict)}, RawContent: {raw_instruction_content[:500]}...", "debug")
 
             if parsed_instr_type not in ['freezeAccount', 'thawAccount']: 
-                # Loggen nur, wenn parsed_instr_type nicht "N/A" war (also ein Typ erkannt wurde, aber nicht der richtige)
                 if self.debug_mode and parsed_instr_type != "N/A": self.log_func(f"DEBUG (Freeze/Thaw Check - TX: {signature_str}, Idx: {instruction_idx}): Typ '{parsed_instr_type}' nicht relevant. Überspringe.", "debug")
                 continue
             
@@ -470,8 +529,9 @@ class WhitelistMonitorBot:
                 continue
 
             wallet_owner_address_str = None
-            all_token_balances = (getattr(tx_resp.value.transaction.meta, 'pre_token_balances', []) or []) + \
-                                 (getattr(tx_resp.value.transaction.meta, 'post_token_balances', []) or [])
+            # <<< KORREKTUR: Zugriff auf tx_meta hier nicht mehr direkt möglich, stattdessen tx_response_value verwenden >>>
+            all_token_balances = (getattr(tx_response_value.transaction.meta, 'pre_token_balances', []) or []) + \
+                                 (getattr(tx_response_value.transaction.meta, 'post_token_balances', []) or [])
             for tb_idx, tb in enumerate(all_token_balances):
                 if hasattr(tb, 'account_index') and hasattr(tb, 'owner') and hasattr(tb, 'mint') and \
                    isinstance(tb.mint, Pubkey) and tb.mint == self.mint_pubkey and \
@@ -659,7 +719,7 @@ class MonitorUI(ctk.CTk):
         config = load_config(); 
         if not config: show_error(self, "Konfigurationsfehler", "config.json nicht gefunden."); return
         
-        http_client = None # Ensure defined for finally block
+        http_client = None
         try:
             payer_keypair = load_keypair(config['wallet_folder'], "payer-wallet.json")
             mint_pubkey_obj = load_keypair(config['wallet_folder'], "mint-wallet.json").pubkey() 
@@ -681,12 +741,11 @@ class MonitorUI(ctk.CTk):
             else: return
 
             latest_blockhash_resp = http_client.get_latest_blockhash()
-            # Korrekte Erstellung der Transaktion
             transaction = Transaction.new_signed_with_payer(
-                [instruction], # instructions
-                payer_keypair.pubkey(), # payer
-                [payer_keypair], # signers
-                latest_blockhash_resp.value.blockhash # recent_blockhash
+                [instruction], 
+                payer_keypair.pubkey(), 
+                [payer_keypair], 
+                latest_blockhash_resp.value.blockhash 
             )
             
             resp = http_client.send_transaction(transaction)
@@ -709,9 +768,7 @@ class MonitorUI(ctk.CTk):
             if self.debug_mode_var.get(): import traceback; self.log(traceback.format_exc(), "debug")
             show_error(self, "Blockchain Fehler", f"Aktion fehlgeschlagen für {wallet_address_str}:\n\n{e}")
         finally: 
-            # http_client.close() ist nicht nötig für solana.rpc.api.Client
             pass
-
 
     def manual_freeze_wallet(self): self._perform_manual_account_action("freeze")
     def manual_thaw_wallet(self): self._perform_manual_account_action("thaw")
