@@ -13,7 +13,7 @@ import json
 import asyncio
 import logging
 import webbrowser
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime
 from typing import Dict, Set, Optional
 
@@ -127,27 +127,70 @@ class NetworkVisualizer:
 
     def generate_graph(self):
         if not os.path.exists(self.log_file): raise FileNotFoundError("Log-Datei 'transactions.jsonl' nicht gefunden.")
-        net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=True, cdn_resources='in_line')
-        all_wallets, frozen_wallets, edges = set(), set(), []
+        
+        all_wallets, frozen_wallets = set(), set()
+        balances = defaultdict(float)
+        flows = defaultdict(float)
+
         with open(self.log_file, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     tx = json.loads(line)
-                    sender, recipient = tx.get('sender'), tx.get('recipient')
-                    if sender: all_wallets.add(sender)
-                    if recipient: all_wallets.add(recipient)
-                    if sender and recipient: edges.append(tx)
-                    if tx.get('status') == 'VIOLATION_FROZEN': frozen_wallets.update(tx.get('frozen_wallets', []))
-                except json.JSONDecodeError: continue
+                    sender, recipient, amount = tx.get('sender'), tx.get('recipient'), tx.get('amount', 0)
+                    
+                    if not sender or not recipient: continue # Nur Transfers mit Sender und Empfänger berücksichtigen
+
+                    all_wallets.add(sender)
+                    all_wallets.add(recipient)
+                    
+                    # Berechne Bestände
+                    balances[sender] -= amount
+                    balances[recipient] += amount
+
+                    # Aggregiere Flüsse zwischen Wallets
+                    flow_key = tuple(sorted((sender, recipient)))
+                    flows[flow_key] += amount
+
+                    if tx.get('status') == 'VIOLATION_FROZEN':
+                        frozen_wallets.update(tx.get('frozen_wallets', []))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        
+        net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=True, cdn_resources='in_line')
+
         for wallet in all_wallets:
             color = DesignSystem.COLORS['error'] if wallet in frozen_wallets else (DesignSystem.COLORS['success'] if wallet in self.whitelist else DesignSystem.COLORS['primary'])
-            net.add_node(wallet, label=truncate_address(wallet), title=wallet, color=color)
-        for tx in edges:
-            try: net.add_edge(tx['sender'], tx['recipient'], title=f"{tx.get('amount', 0)} Tokens", value=tx.get('amount', 0))
-            except Exception: continue
-        net.set_options("""{"physics": {"barnesHut": {"gravitationalConstant": -2000, "centralGravity": 0.1, "springLength": 150}, "minVelocity": 0.75}}""")
+            balance_str = f"{balances[wallet]:.4f}".rstrip('0').rstrip('.')
+            node_title = f"{wallet}<br><b>Berechneter Bestand:</b> {balance_str} Tokens"
+            net.add_node(wallet, label=truncate_address(wallet), title=node_title, color=color)
+
+        for (addr1, addr2), total_amount in flows.items():
+            amount_str = f"{total_amount:.4f}".rstrip('0').rstrip('.')
+            edge_title = f"<b>Gesamtvolumen:</b><br>{amount_str} Tokens"
+            net.add_edge(addr1, addr2, title=edge_title, value=total_amount, label=f"{amount_str}")
+
+        net.set_options("""
+        var options = {
+          "edges": {
+            "font": {
+              "size": 14,
+              "strokeWidth": 0
+            },
+            "smooth": {
+              "type": "cubicBezier"
+            }
+          },
+          "physics": {
+            "barnesHut": {
+              "gravitationalConstant": -2500,
+              "centralGravity": 0.1,
+              "springLength": 150
+            },
+            "minVelocity": 0.75
+          }
+        }
+        """)
         
-        # KORREKTUR: Manuelles Speichern der Datei mit UTF-8-Kodierung, um den 'charmap' Fehler zu vermeiden
         try:
             html_content = net.generate_html()
             with open(self.output_path, 'w', encoding='utf-8') as f:
@@ -199,7 +242,6 @@ class WhitelistMonitorBot:
         if signature_str in self.processed_signatures: return
 
         # --- Client-seitiger Filter ---
-        # 1. Transaktion einmalig abrufen
         try:
             sig = Signature.from_string(signature_str)
             tx_resp = await self.async_http_client.get_transaction(sig, max_supported_transaction_version=0)
@@ -207,9 +249,8 @@ class WhitelistMonitorBot:
                 return
         except Exception: return # Ignorieren, wenn Abruf fehlschlägt
 
-        # 2. Prüfen, ob die Transaktion unseren Token betrifft
         tx_meta = tx_resp.value.transaction.meta
-        is_relevant = any(b.mint == self.mint_keypair.pubkey() for b in (tx_meta.pre_token_balances + tx_meta.post_token_balances))
+        is_relevant = any(hasattr(b, 'mint') and b.mint == self.mint_keypair.pubkey() for b in (tx_meta.pre_token_balances + tx_meta.post_token_balances))
         if not is_relevant:
             return
 
@@ -224,18 +265,18 @@ class WhitelistMonitorBot:
             account_keys = tx_resp.value.transaction.transaction.message.account_keys
             balance_changes = {} 
             for balance in (tx_meta.pre_token_balances + tx_meta.post_token_balances):
-                if balance.mint == self.mint_keypair.pubkey():
+                if hasattr(balance, 'mint') and balance.mint == self.mint_keypair.pubkey():
                     owner_str = str(balance.owner)
                     if owner_str not in balance_changes:
                         balance_changes[owner_str] = {'ata': account_keys[balance.account_index], 'pre': 0, 'post': 0}
             
             for pre in tx_meta.pre_token_balances:
-                if str(pre.owner) in balance_changes: 
-                    if pre.ui_token_amount.amount:
+                if hasattr(pre, 'owner') and str(pre.owner) in balance_changes: 
+                    if hasattr(pre, 'ui_token_amount') and pre.ui_token_amount.amount:
                         balance_changes[str(pre.owner)]['pre'] = int(pre.ui_token_amount.amount)
             for post in tx_meta.post_token_balances:
-                if str(post.owner) in balance_changes: 
-                    if post.ui_token_amount.amount:
+                if hasattr(post, 'owner') and str(post.owner) in balance_changes: 
+                    if hasattr(post, 'ui_token_amount') and post.ui_token_amount.amount:
                         balance_changes[str(post.owner)]['post'] = int(post.ui_token_amount.amount)
 
             for owner, data in balance_changes.items():
@@ -281,15 +322,9 @@ class WhitelistMonitorBot:
             try:
                 async with websockets.connect(self.ws_uri) as websocket:
                     self.log_func(f"🔌 Verbunden mit WebSocket: {self.ws_uri}", "success")
-                    # *** KORRIGIERTE METHODE: logsSubscribe mit breiterem Filter ***
                     await websocket.send(json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "logsSubscribe",
-                        "params": [
-                            {"mentions": [str(TOKEN_PROGRAM_ID)]},
-                            {"commitment": "finalized"}
-                        ]
+                        "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                        "params": [{"mentions": [str(TOKEN_PROGRAM_ID)]}, {"commitment": "finalized"}]
                     }))
                     await websocket.recv() # Subscription confirmation
                     self.log_func(f"\n{DesignSystem.ICONS['success']} Angemeldet für Token-Program-Logs. Warte auf Transaktionen...", "success")
@@ -301,10 +336,8 @@ class WhitelistMonitorBot:
                                 log_value = data.get('params', {}).get('result', {}).get('value', {})
                                 if log_value and not log_value.get('err'):
                                     sig = log_value.get('signature')
-                                    if sig:
-                                        await self._analyze_transaction(sig)
-                        except asyncio.TimeoutError:
-                            continue
+                                    if sig: await self._analyze_transaction(sig)
+                        except asyncio.TimeoutError: continue
             except Exception as e:
                 self.log_func(f"🔌 WebSocket-Fehler: {e}. Versuche in 10s erneut...", "error")
                 await asyncio.sleep(10)
