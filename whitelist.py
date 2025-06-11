@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # === Blockchain Monitor: Erweitertes Überwachungstool mit Visualisierung ===
 
+# WICHTIG! Das programm hat einen Fehler. Freeze funktioniert nicht und muss dringend behoben werden!!!
+# Hier ein Auszug aus dem Programm Log
+#--- Analyse: 5SDfSiHHNd5KDrtM5UPnN4zHNwwCZW... ---
+#Absender:    DHN7...z5ef
+#Empfänger:   dad5...o34p
+#Menge:       1000.0 Tokens
+#STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.
+#→ Option 'Absender ebenfalls sperren' aktiv.
+#------------------------------------------
+#❄️ Friere Konto für Empfänger ein: dad5GTFHHHyNeEcZR7G9hkjFTS7aihdCPmZnYquo34p...
+#❌ FEHLER bei 'Empfänger Konto einfrieren': argument 'pubkey': 'ParsedAccountTxStatus' object cannot be converted to 'Pubkey'
+#❄️ Friere Konto für Absender ein: DHN7hBzXcS3HqLXJQwanQU6fzhknZvEuwtDAuwexz5ef...
+#❌ FEHLER bei 'Absender Konto einfrieren': argument 'pubkey': 'ParsedAccountTxStatus' object cannot be converted to 'Pubkey'
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox, filedialog
