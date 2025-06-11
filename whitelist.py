@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # === Blockchain Monitor: Erweitertes Überwachungstool mit Visualisierung ===
 
-# WICHTIG! Das programm hat einen Fehler. Freeze funktioniert nicht und muss dringend behoben werden!!!
-# Hier ein Auszug aus dem Programm Log
-#--- Analyse: 5SDfSiHHNd5KDrtM5UPnN4zHNwwCZW... ---
-#Absender:    DHN7...z5ef
-#Empfänger:   dad5...o34p
-#Menge:       1000.0 Tokens
-#STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.
-#→ Option 'Absender ebenfalls sperren' aktiv.
-#------------------------------------------
-#❄️ Friere Konto für Empfänger ein: dad5GTFHHHyNeEcZR7G9hkjFTS7aihdCPmZnYquo34p...
-#❌ FEHLER bei 'Empfänger Konto einfrieren': argument 'pubkey': 'ParsedAccountTxStatus' object cannot be converted to 'Pubkey'
-#❄️ Friere Konto für Absender ein: DHN7hBzXcS3HqLXJQwanQU6fzhknZvEuwtDAuwexz5ef...
-#❌ FEHLER bei 'Absender Konto einfrieren': argument 'pubkey': 'ParsedAccountTxStatus' object cannot be converted to 'Pubkey'
-
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -61,7 +47,7 @@ def setup_transaction_logger():
     """Konfiguriert einen Logger, um Transaktionen in eine Datei zu schreiben."""
     logger = logging.getLogger('transaction_logger')
     logger.setLevel(logging.INFO)
-    logger.propagate = False 
+    logger.propagate = False
     if not logger.handlers:
         handler = logging.FileHandler('transactions.jsonl', mode='a', encoding='utf-8')
         logger.addHandler(handler)
@@ -143,7 +129,7 @@ class NetworkVisualizer:
         if not os.path.exists(self.log_file): raise FileNotFoundError("Log-Datei 'transactions.jsonl' nicht gefunden.")
         
         all_wallets = set()
-        balances = defaultdict(float)
+        balances = defaultdict(float) # Zum Speichern der berechneten Salden
         flows = defaultdict(float)
         final_frozen_wallets = set()
 
@@ -154,11 +140,14 @@ class NetworkVisualizer:
                     status = tx.get('status')
 
                     sender, recipient, amount = tx.get('sender'), tx.get('recipient'), tx.get('amount', 0)
-                    if sender and recipient:
+                    if sender and recipient and isinstance(amount, (int, float)) and amount > 0: # Sicherstellen, dass amount eine Zahl ist
                         all_wallets.add(sender)
                         all_wallets.add(recipient)
+                        
+                        # Salden aktualisieren
                         balances[sender] -= amount
                         balances[recipient] += amount
+                        
                         flow_key = tuple(sorted((sender, recipient)))
                         flows[flow_key] += amount
 
@@ -167,22 +156,34 @@ class NetworkVisualizer:
                     elif status == 'ACCOUNT_FROZEN':
                         wallet = tx.get('frozen_wallet')
                         if wallet:
-                            all_wallets.add(wallet)
+                            all_wallets.add(wallet) # Sicherstellen, dass auch nur gefrorene Wallets berücksichtigt werden
                             final_frozen_wallets.add(wallet)
                     elif status == 'ACCOUNT_THAWED':
                         wallet = tx.get('thawed_wallet')
                         if wallet and wallet in final_frozen_wallets:
                             final_frozen_wallets.remove(wallet)
                             
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, ValueError) as e: 
+                    # Optional: Loggen, wenn eine Zeile nicht verarbeitet werden kann
+                    # print(f"Konnte Zeile nicht verarbeiten: {line.strip()} - Fehler: {e}")
                     continue
         
         net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=True, cdn_resources='in_line')
 
+        # Stelle sicher, dass alle Wallets, die in flows oder final_frozen_wallets vorkommen, auch in all_wallets sind
+        for addr1, addr2 in flows.keys():
+            all_wallets.add(addr1)
+            all_wallets.add(addr2)
+        all_wallets.update(final_frozen_wallets)
+
+
         for wallet in all_wallets:
             color = DesignSystem.COLORS['error'] if wallet in final_frozen_wallets else (DesignSystem.COLORS['success'] if wallet in self.whitelist else DesignSystem.COLORS['primary'])
-            balance_str = f"{balances[wallet]:.4f}".rstrip('0').rstrip('.')
+            
+            # Berechneten Saldo formatieren und zum Tooltip hinzufügen
+            balance_str = f"{balances[wallet]:.4f}".rstrip('0').rstrip('.') # ".4f" für 4 Dezimalstellen, rstrip für saubere Darstellung
             node_title = f"{wallet}<br><b>Berechneter Bestand:</b> {balance_str} Tokens"
+            
             net.add_node(wallet, label=truncate_address(wallet), title=node_title, color=color)
 
         for (addr1, addr2), total_amount in flows.items():
@@ -201,6 +202,7 @@ class NetworkVisualizer:
             with open(self.output_path, 'w', encoding='utf-8') as f: f.write(html_content)
         except Exception as e:
             raise IOError(f"Fehler beim Speichern der HTML-Visualisierungsdatei: {e}")
+
 
 # === Whitelist Monitor Logik ===
 class WhitelistMonitorBot:
@@ -298,7 +300,10 @@ class WhitelistMonitorBot:
                 if hasattr(balance, 'mint') and balance.mint == self.mint_keypair.pubkey():
                     owner_str = str(balance.owner)
                     if owner_str not in balance_changes:
-                        balance_changes[owner_str] = {'ata': account_keys[balance.account_index], 'pre': 0, 'post': 0}
+                        account_data = account_keys[balance.account_index]
+                        actual_pubkey_for_ata = account_data.pubkey if hasattr(account_data, 'pubkey') else account_data
+                        balance_changes[owner_str] = {'ata': actual_pubkey_for_ata, 'pre': 0, 'post': 0}
+
 
             for pre in pre_balances:
                 if hasattr(pre, 'owner') and str(pre.owner) in balance_changes and hasattr(pre, 'ui_token_amount') and pre.ui_token_amount.amount:
@@ -385,7 +390,7 @@ class WhitelistMonitorBot:
                         "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                         "params": [{"mentions": [str(TOKEN_PROGRAM_ID)]}, {"commitment": "finalized"}]
                     }))
-                    await websocket.recv() 
+                    await websocket.recv()
                     self.log_func(f"\n{DesignSystem.ICONS['success']} Angemeldet für Token-Program-Logs. Warte auf Transaktionen...", "success")
                     while not self.stop_event.is_set() and not self.reload_event.is_set():
                         try:
@@ -478,9 +483,31 @@ class MonitorUI(ctk.CTk):
 
     def _create_network_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(tab, text="Interaktive Transaktions-Visualisierung", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=20, pady=20, sticky="w")
-        info_text = "Klicken Sie auf den Button, um eine interaktive Netzwerkkarte aus den geloggten Transaktionen zu erstellen. Die Karte wird in Ihrem Webbrowser geöffnet.\n\n- Grüne Knoten: Whitelist-Adressen\n- Rote Knoten: Gesperrte Adressen\n- Blaue Knoten: Andere Adressen"
-        ctk.CTkLabel(tab, text=info_text, wraplength=600, justify="left").grid(row=1, column=0, padx=20, pady=10, sticky="nw")
+        ctk.CTkLabel(tab, text="Interaktive Transaktions-Visualisierung", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=20, pady=(20,10), sticky="w")
+        
+        info_text_paragraph1 = (
+            "Klicken Sie auf den Button, um eine interaktive Netzwerkkarte aus den geloggten Transaktionen zu erstellen. "
+            "Die Karte wird in Ihrem Webbrowser geöffnet.\n\n"
+            "- Grüne Knoten: Whitelist-Adressen\n"
+            "- Rote Knoten: Gesperrte Adressen\n"
+            "- Blaue Knoten: Andere Adressen"
+        )
+        info_text_warning_header = "Wichtiger Hinweis:"
+        info_text_warning_detail = (
+            "Die in der Visualisierung angezeigten Token-Bestände sind Schätzungen, "
+            "die ausschließlich auf den Transaktionen in der Datei 'transactions.jsonl' basieren. "
+            "Sie spiegeln möglicherweise nicht den exakten Echtzeit-Kontostand auf der Blockchain wider, "
+            "insbesondere wenn nicht alle Transaktionen erfasst wurden oder Konten außerhalb dieses Tools verändert wurden."
+        )
+        
+        info_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        info_frame.grid(row=1, column=0, padx=20, pady=(0,10), sticky="nw")
+
+        ctk.CTkLabel(info_frame, text=info_text_paragraph1, wraplength=700, justify="left").pack(anchor="w")
+        
+        ctk.CTkLabel(info_frame, text=info_text_warning_header, font=ctk.CTkFont(weight="bold"), wraplength=700, justify="left").pack(anchor="w", pady=(10,0))
+        ctk.CTkLabel(info_frame, text=info_text_warning_detail, wraplength=700, justify="left").pack(anchor="w")
+
         self.update_graph_button = ctk.CTkButton(tab, text=f"{DesignSystem.ICONS['graph']} Visualisierung erstellen & öffnen", command=self.generate_and_open_graph, height=40)
         self.update_graph_button.grid(row=2, column=0, padx=20, pady=20, sticky="w")
         self.graph_status_label = ctk.CTkLabel(tab, text="", text_color=DesignSystem.COLORS['text_secondary'])
@@ -510,7 +537,7 @@ class MonitorUI(ctk.CTk):
             config = load_config()
             if not config: raise ValueError("Konfiguration konnte nicht geladen werden.")
             self.monitor_instance = WhitelistMonitorBot(
-                config, self.log, self.stop_event, self.reload_event, 
+                config, self.log, self.stop_event, self.reload_event,
                 self.freeze_sender_check.get(), self.freeze_recipient_check.get(), self.transaction_logger
             )
             self.monitor_thread = threading.Thread(target=lambda: asyncio.run(self.monitor_instance.run()), daemon=True)
@@ -525,7 +552,7 @@ class MonitorUI(ctk.CTk):
         if self.stop_event: self.stop_event.set()
         self.start_button.configure(state="normal"); self.stop_button.configure(state="disabled")
         self.freeze_recipient_check.configure(state="normal")
-        self.toggle_sender_freeze_option() 
+        self.toggle_sender_freeze_option()
         self.status_indicator.set_status("unknown", "Gestoppt")
         self.monitor_instance = None; self.monitor_thread = None
 
@@ -579,7 +606,10 @@ class MonitorUI(ctk.CTk):
             self.whitelist_textbox.insert("1.0", content)
             self.whitelist_textbox.configure(state="disabled")
         except Exception as e:
+            self.whitelist_textbox.configure(state="normal")
+            self.whitelist_textbox.delete("1.0", "end")
             self.whitelist_textbox.insert("1.0", f"Fehler beim Laden: {e}")
+            self.whitelist_textbox.configure(state="disabled")
             
     def toggle_sender_freeze_option(self):
         """Aktiviert/Deaktiviert die Checkbox zum Sperren des Senders."""
