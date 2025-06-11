@@ -1,9 +1,10 @@
-# === requirements.txt ===
+# === requirements.txt: Aktualisierte und korrekte Abhängigkeiten ===
 
 # --- Solana Core Libraries ---
 # Für die Interaktion mit der Solana-Blockchain, Transaktionen und Tokens.
 solana==0.36.6
 solders==0.26.0
+spl-token==0.6.0        # Notwendig für SPL-Token-Operationen (freeze, mint, etc.).
 borsh-construct==0.1.0  # Wird in setup.py zur Serialisierung von Metadaten verwendet.
 
 # --- Graphical User Interface (GUI) ---
@@ -16,3 +17,6 @@ Pillow==10.4.0          # Wird in setup.py zur Bildverarbeitung (Token-Icon) ben
 # Für HTTP-Anfragen (Pinata) und WebSocket-Verbindungen (Whitelist-Monitor).
 requests==2.32.3
 websockets==15.0
+
+# --- Für Netzwerkvisualisierung ---
+pyvis==0.3.2
