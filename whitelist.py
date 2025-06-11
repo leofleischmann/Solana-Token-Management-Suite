@@ -128,38 +128,45 @@ class NetworkVisualizer:
     def generate_graph(self):
         if not os.path.exists(self.log_file): raise FileNotFoundError("Log-Datei 'transactions.jsonl' nicht gefunden.")
         
-        all_wallets, frozen_wallets = set(), set()
+        all_wallets = set()
         balances = defaultdict(float)
         flows = defaultdict(float)
+        final_frozen_wallets = set()
 
         with open(self.log_file, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     tx = json.loads(line)
+                    status = tx.get('status')
+
                     sender, recipient, amount = tx.get('sender'), tx.get('recipient'), tx.get('amount', 0)
-                    
-                    if not sender or not recipient: continue # Nur Transfers mit Sender und Empfänger berücksichtigen
+                    if sender and recipient:
+                        all_wallets.add(sender)
+                        all_wallets.add(recipient)
+                        balances[sender] -= amount
+                        balances[recipient] += amount
+                        flow_key = tuple(sorted((sender, recipient)))
+                        flows[flow_key] += amount
 
-                    all_wallets.add(sender)
-                    all_wallets.add(recipient)
-                    
-                    # Berechne Bestände
-                    balances[sender] -= amount
-                    balances[recipient] += amount
-
-                    # Aggregiere Flüsse zwischen Wallets
-                    flow_key = tuple(sorted((sender, recipient)))
-                    flows[flow_key] += amount
-
-                    if tx.get('status') == 'VIOLATION_FROZEN':
-                        frozen_wallets.update(tx.get('frozen_wallets', []))
+                    if status == 'VIOLATION_FROZEN':
+                        final_frozen_wallets.update(tx.get('frozen_wallets', []))
+                    elif status == 'ACCOUNT_FROZEN':
+                        wallet = tx.get('frozen_wallet')
+                        if wallet:
+                            all_wallets.add(wallet)
+                            final_frozen_wallets.add(wallet)
+                    elif status == 'ACCOUNT_THAWED':
+                        wallet = tx.get('thawed_wallet')
+                        if wallet and wallet in final_frozen_wallets:
+                            final_frozen_wallets.remove(wallet)
+                            
                 except (json.JSONDecodeError, TypeError):
                     continue
         
         net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=True, cdn_resources='in_line')
 
         for wallet in all_wallets:
-            color = DesignSystem.COLORS['error'] if wallet in frozen_wallets else (DesignSystem.COLORS['success'] if wallet in self.whitelist else DesignSystem.COLORS['primary'])
+            color = DesignSystem.COLORS['error'] if wallet in final_frozen_wallets else (DesignSystem.COLORS['success'] if wallet in self.whitelist else DesignSystem.COLORS['primary'])
             balance_str = f"{balances[wallet]:.4f}".rstrip('0').rstrip('.')
             node_title = f"{wallet}<br><b>Berechneter Bestand:</b> {balance_str} Tokens"
             net.add_node(wallet, label=truncate_address(wallet), title=node_title, color=color)
@@ -171,41 +178,25 @@ class NetworkVisualizer:
 
         net.set_options("""
         var options = {
-          "edges": {
-            "font": {
-              "size": 14,
-              "strokeWidth": 0
-            },
-            "smooth": {
-              "type": "cubicBezier"
-            }
-          },
-          "physics": {
-            "barnesHut": {
-              "gravitationalConstant": -2500,
-              "centralGravity": 0.1,
-              "springLength": 150
-            },
-            "minVelocity": 0.75
-          }
-        }
-        """)
+          "edges": { "font": { "size": 14, "strokeWidth": 0 }, "smooth": { "type": "cubicBezier" } },
+          "physics": { "barnesHut": { "gravitationalConstant": -2500, "centralGravity": 0.1, "springLength": 150 }, "minVelocity": 0.75 }
+        }""")
         
         try:
             html_content = net.generate_html()
-            with open(self.output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
+            with open(self.output_path, 'w', encoding='utf-8') as f: f.write(html_content)
         except Exception as e:
             raise IOError(f"Fehler beim Speichern der HTML-Visualisierungsdatei: {e}")
-
 
 # === Whitelist Monitor Logik ===
 class WhitelistMonitorBot:
     TOKEN_DECIMALS = 9
     
-    def __init__(self, config: dict, log_func, stop_event: threading.Event, reload_event: threading.Event, freeze_sender: bool, transaction_logger, notification_callback=None):
+    def __init__(self, config: dict, log_func, stop_event: threading.Event, reload_event: threading.Event, freeze_sender: bool, freeze_recipient: bool, transaction_logger, notification_callback=None):
         self.config, self.log_func, self.stop_event, self.reload_event = config, log_func, stop_event, reload_event
-        self.freeze_sender_on_violation, self.transaction_logger, self.notification_callback = freeze_sender, transaction_logger, notification_callback
+        self.freeze_sender_on_violation = freeze_sender
+        self.freeze_recipient_on_violation = freeze_recipient
+        self.transaction_logger, self.notification_callback = transaction_logger, notification_callback
         self.wallet_folder = config['wallet_folder']
         self.ws_uri = config['rpc_url'].replace("http", "ws")
         self.stats = {'transactions_analyzed': 0, 'violations_detected': 0, 'accounts_frozen': 0, 'start_time': datetime.now()}
@@ -241,80 +232,134 @@ class WhitelistMonitorBot:
     async def _analyze_transaction(self, signature_str: str):
         if signature_str in self.processed_signatures: return
 
-        # --- Client-seitiger Filter ---
         try:
             sig = Signature.from_string(signature_str)
-            tx_resp = await self.async_http_client.get_transaction(sig, max_supported_transaction_version=0)
-            if not tx_resp or not tx_resp.value or not tx_resp.value.transaction or tx_resp.value.transaction.meta.err:
-                return
-        except Exception: return # Ignorieren, wenn Abruf fehlschlägt
+            tx_resp = await self.async_http_client.get_transaction(sig, max_supported_transaction_version=0, encoding="jsonParsed")
+            if not tx_resp or not tx_resp.value or not tx_resp.value.transaction or tx_resp.value.transaction.meta.err: return
+        except Exception: return
 
         tx_meta = tx_resp.value.transaction.meta
-        is_relevant = any(hasattr(b, 'mint') and b.mint == self.mint_keypair.pubkey() for b in (tx_meta.pre_token_balances + tx_meta.post_token_balances))
-        if not is_relevant:
+        
+        has_mint_in_balances = any(
+            hasattr(b, 'mint') and b.mint == self.mint_keypair.pubkey()
+            for b in (getattr(tx_meta, 'pre_token_balances', []) or []) + (getattr(tx_meta, 'post_token_balances', []) or [])
+        )
+
+        has_mint_in_instructions = False
+        if tx_resp.value.transaction.transaction.message.instructions:
+            for instruction in tx_resp.value.transaction.transaction.message.instructions:
+                if isinstance(instruction, dict) and 'parsed' in instruction:
+                    info = instruction.get('parsed', {}).get('info', {})
+                    if info.get('mint') == str(self.mint_keypair.pubkey()):
+                        has_mint_in_instructions = True
+                        break
+        
+        if not (has_mint_in_balances or has_mint_in_instructions):
             return
 
-        # --- RELEVANTE TRANSAKTION GEFUNDEN - ANALYSE STARTEN ---
         self.processed_signatures.append(signature_str)
         self.stats['transactions_analyzed'] += 1
         self.log_func(f"\n--- Analyse: {signature_str[:30]}... ---", "header")
         
-        log_entry = {'timestamp': datetime.utcnow().isoformat(),'signature': signature_str, 'sender': None, 'recipient': None, 'amount': 0, 'status': 'UNKNOWN', 'frozen_wallets': []}
+        transfer_logged = self._log_transfer_if_present(tx_resp, signature_str)
+        freeze_thaw_logged = await self._log_freeze_thaw_if_present(tx_resp, signature_str)
 
+        if not transfer_logged and not freeze_thaw_logged:
+            self.log_func("→ Keine Aktion für diesen Token gefunden (z.B. Transfer anderer Tokens).", "info")
+
+        self.log_func("------------------------------------------", "header")
+
+    def _log_transfer_if_present(self, tx_resp, signature_str: str) -> bool:
+        tx_meta = tx_resp.value.transaction.meta
+        log_entry = {'timestamp': datetime.utcnow().isoformat(), 'signature': signature_str, 'sender': None, 'recipient': None, 'amount': 0, 'status': 'UNKNOWN', 'frozen_wallets': []}
+        
         try:
             account_keys = tx_resp.value.transaction.transaction.message.account_keys
-            balance_changes = {} 
-            for balance in (tx_meta.pre_token_balances + tx_meta.post_token_balances):
+            balance_changes = {}
+            # Sicherer Zugriff auf pre/post_token_balances
+            pre_balances = getattr(tx_meta, 'pre_token_balances', []) or []
+            post_balances = getattr(tx_meta, 'post_token_balances', []) or []
+
+            for balance in (pre_balances + post_balances):
                 if hasattr(balance, 'mint') and balance.mint == self.mint_keypair.pubkey():
                     owner_str = str(balance.owner)
                     if owner_str not in balance_changes:
                         balance_changes[owner_str] = {'ata': account_keys[balance.account_index], 'pre': 0, 'post': 0}
-            
-            for pre in tx_meta.pre_token_balances:
-                if hasattr(pre, 'owner') and str(pre.owner) in balance_changes: 
-                    if hasattr(pre, 'ui_token_amount') and pre.ui_token_amount.amount:
-                        balance_changes[str(pre.owner)]['pre'] = int(pre.ui_token_amount.amount)
-            for post in tx_meta.post_token_balances:
-                if hasattr(post, 'owner') and str(post.owner) in balance_changes: 
-                    if hasattr(post, 'ui_token_amount') and post.ui_token_amount.amount:
-                        balance_changes[str(post.owner)]['post'] = int(post.ui_token_amount.amount)
+
+            for pre in pre_balances:
+                if hasattr(pre, 'owner') and str(pre.owner) in balance_changes and hasattr(pre, 'ui_token_amount') and pre.ui_token_amount.amount:
+                    balance_changes[str(pre.owner)]['pre'] = int(pre.ui_token_amount.amount)
+            for post in post_balances:
+                if hasattr(post, 'owner') and str(post.owner) in balance_changes and hasattr(post, 'ui_token_amount') and post.ui_token_amount.amount:
+                    balance_changes[str(post.owner)]['post'] = int(post.ui_token_amount.amount)
 
             for owner, data in balance_changes.items():
                 change = data['post'] - data['pre']
-                if change < 0:
-                    log_entry['sender'] = owner
-                    log_entry['amount'] = abs(change) / (10**self.TOKEN_DECIMALS)
-                elif change > 0:
-                    log_entry['recipient'] = owner
-
+                if change < 0: log_entry['sender'] = owner; log_entry['amount'] = abs(change) / (10**self.TOKEN_DECIMALS)
+                elif change > 0: log_entry['recipient'] = owner
+            
             sender, recipient = log_entry['sender'], log_entry['recipient']
-            if not sender or not recipient:
-                log_entry['status'] = 'NON_TRANSFER'
-                self.log_func("→ Kein Transfer (z.B. Mint/Burn), ignoriert.", "info")
+            if not sender or not recipient: return False
+
+            self.log_func(f"Absender:    {truncate_address(sender)}", "info")
+            self.log_func(f"Empfänger:   {truncate_address(recipient)}", "info")
+            self.log_func(f"Menge:       {log_entry['amount']} Tokens", "info")
+
+            if recipient in self.whitelist:
+                self.log_func("STATUS: ✅ Empfänger ist autorisiert.", "success"); log_entry['status'] = 'AUTHORIZED'
             else:
-                self.log_func(f"Absender:    {truncate_address(sender)}", "info")
-                self.log_func(f"Empfänger:   {truncate_address(recipient)}", "info")
-                self.log_func(f"Menge:       {log_entry['amount']} Tokens", "info")
-                if recipient in self.whitelist:
-                    self.log_func("STATUS: ✅ Empfänger ist autorisiert.", "success")
-                    log_entry['status'] = 'AUTHORIZED'
-                else:
-                    self.log_func("STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.", "error")
-                    self.stats['violations_detected'] += 1
-                    log_entry['status'] = 'VIOLATION_FROZEN'
-                    if self.notification_callback: self.notification_callback("Whitelist-Verstoß", f"Transfer an {truncate_address(recipient)}")
-                    await self._freeze_account(balance_changes[recipient]['ata'], recipient, "Empfänger")
+                self.log_func("STATUS: 🚨 Whitelist-Verstoß! Empfänger nicht autorisiert.", "error"); self.stats['violations_detected'] += 1; log_entry['status'] = 'VIOLATION_FROZEN'
+                if self.notification_callback: self.notification_callback("Whitelist-Verstoß", f"Transfer an {truncate_address(recipient)}")
+                
+                if self.freeze_recipient_on_violation:
+                    asyncio.create_task(self._freeze_account(balance_changes[recipient]['ata'], recipient, "Empfänger"))
                     log_entry['frozen_wallets'].append(recipient)
                     if self.freeze_sender_on_violation:
-                        self.log_func("→ Option 'Absender ebenfalls einfrieren' aktiv.", "info")
-                        await self._freeze_account(balance_changes[sender]['ata'], sender, "Absender")
-                        log_entry['frozen_wallets'].append(sender)
-        except Exception as e: 
-            self.log_func(f"{DesignSystem.ICONS['error']} Fehler bei Detail-Analyse: {e}", "error")
-            log_entry['status'] = 'ANALYSIS_ERROR'
-        finally:
+                        self.log_func("→ Option 'Absender ebenfalls sperren' aktiv.", "info")
+                        asyncio.create_task(self._freeze_account(balance_changes[sender]['ata'], sender, "Absender"))
+                        if sender not in log_entry['frozen_wallets']: log_entry['frozen_wallets'].append(sender)
+                else:
+                    self.log_func("→ Option 'Empfänger sperren' ist deaktiviert.", "warning")
+            
             self.transaction_logger.info(json.dumps(log_entry))
-            self.log_func("------------------------------------------", "header")
+            return True
+        except Exception as e:
+            self.log_func(f"{DesignSystem.ICONS['error']} Fehler bei Transfer-Analyse: {e}", "error")
+            return False
+
+    async def _log_freeze_thaw_if_present(self, tx_resp, signature_str: str) -> bool:
+        instructions = tx_resp.value.transaction.transaction.message.instructions
+        logged_something = False
+
+        for instruction in instructions:
+            if not (isinstance(instruction, dict) and 'parsed' in instruction): continue
+            
+            parsed_info = instruction.get('parsed', {})
+            instruction_type = parsed_info.get('type')
+
+            if instruction_type not in ['freezeAccount', 'thawAccount']: continue
+            
+            info = parsed_info.get('info', {})
+            mint = info.get('mint')
+            
+            if mint != str(self.mint_keypair.pubkey()): continue
+            
+            owner = info.get('owner') or info.get('authority')
+            if not owner: continue
+
+            log_entry = {'timestamp': datetime.utcnow().isoformat(), 'signature': signature_str}
+            
+            if instruction_type == 'freezeAccount':
+                self.log_func(f"ℹ️ Externer Freeze erkannt für Wallet: {truncate_address(owner)}", "warning")
+                log_entry.update({'status': 'ACCOUNT_FROZEN', 'frozen_wallet': owner})
+            else: # thawAccount
+                self.log_func(f"ℹ️ Externer Thaw erkannt für Wallet: {truncate_address(owner)}", "info")
+                log_entry.update({'status': 'ACCOUNT_THAWED', 'thawed_wallet': owner})
+
+            self.transaction_logger.info(json.dumps(log_entry))
+            logged_something = True
+            
+        return logged_something
 
     async def run(self):
         while not self.stop_event.is_set():
@@ -326,7 +371,7 @@ class WhitelistMonitorBot:
                         "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
                         "params": [{"mentions": [str(TOKEN_PROGRAM_ID)]}, {"commitment": "finalized"}]
                     }))
-                    await websocket.recv() # Subscription confirmation
+                    await websocket.recv() 
                     self.log_func(f"\n{DesignSystem.ICONS['success']} Angemeldet für Token-Program-Logs. Warte auf Transaktionen...", "success")
                     while not self.stop_event.is_set() and not self.reload_event.is_set():
                         try:
@@ -364,6 +409,7 @@ class MonitorUI(ctk.CTk):
         self._create_widgets()
         self.after(200, self.process_log_queue)
         self.update_whitelist_display()
+        self.toggle_sender_freeze_option()
 
     def _create_widgets(self):
         self._create_header()
@@ -384,8 +430,13 @@ class MonitorUI(ctk.CTk):
         status.grid(row=0, column=2, padx=10, sticky="e")
         self.status_indicator = StatusIndicator(status)
         self.status_indicator.pack(anchor="e")
-        self.freeze_sender_check = ctk.CTkCheckBox(status, text="Absender bei Verstoß ebenfalls sperren")
-        self.freeze_sender_check.pack(anchor="e", pady=5)
+        
+        self.freeze_recipient_check = ctk.CTkCheckBox(status, text="Empfänger bei Verstoß sperren", command=self.toggle_sender_freeze_option)
+        self.freeze_recipient_check.pack(anchor="e", pady=(5,0))
+        self.freeze_recipient_check.select()
+
+        self.freeze_sender_check = ctk.CTkCheckBox(status, text="Absender ebenfalls sperren")
+        self.freeze_sender_check.pack(anchor="e")
         self.freeze_sender_check.select()
 
     def _create_main_content(self):
@@ -437,12 +488,17 @@ class MonitorUI(ctk.CTk):
     def start_monitor(self):
         self.log_textbox.clear_text(); self.log("INFO: Monitor wird gestartet...", "info")
         self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal")
+        self.freeze_recipient_check.configure(state="disabled")
+        self.freeze_sender_check.configure(state="disabled")
         self.status_indicator.set_status("info", "Initialisierung...")
         self.stop_event, self.reload_event = threading.Event(), threading.Event()
         try:
             config = load_config()
             if not config: raise ValueError("Konfiguration konnte nicht geladen werden.")
-            self.monitor_instance = WhitelistMonitorBot(config, self.log, self.stop_event, self.reload_event, self.freeze_sender_check.get(), self.transaction_logger)
+            self.monitor_instance = WhitelistMonitorBot(
+                config, self.log, self.stop_event, self.reload_event, 
+                self.freeze_sender_check.get(), self.freeze_recipient_check.get(), self.transaction_logger
+            )
             self.monitor_thread = threading.Thread(target=lambda: asyncio.run(self.monitor_instance.run()), daemon=True)
             self.monitor_thread.start()
             self.status_indicator.set_status("success", "Läuft")
@@ -454,6 +510,8 @@ class MonitorUI(ctk.CTk):
     def stop_monitor(self):
         if self.stop_event: self.stop_event.set()
         self.start_button.configure(state="normal"); self.stop_button.configure(state="disabled")
+        self.freeze_recipient_check.configure(state="normal")
+        self.toggle_sender_freeze_option() 
         self.status_indicator.set_status("unknown", "Gestoppt")
         self.monitor_instance = None; self.monitor_thread = None
 
@@ -508,6 +566,14 @@ class MonitorUI(ctk.CTk):
             self.whitelist_textbox.configure(state="disabled")
         except Exception as e:
             self.whitelist_textbox.insert("1.0", f"Fehler beim Laden: {e}")
+            
+    def toggle_sender_freeze_option(self):
+        """Aktiviert/Deaktiviert die Checkbox zum Sperren des Senders."""
+        if self.freeze_recipient_check.get() == 1:
+            self.freeze_sender_check.configure(state="normal")
+        else:
+            self.freeze_sender_check.deselect()
+            self.freeze_sender_check.configure(state="disabled")
 
     def on_closing(self):
         self.stop_monitor()
