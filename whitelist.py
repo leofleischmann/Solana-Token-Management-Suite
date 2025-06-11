@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # === Blockchain Monitor: Erweitertes Überwachungstool mit Visualisierung ===
 
+# Problem mit dem Aktuellen code!!!!!
+# Netzwerkkarte kann nicht erstellt werden. Es gibt nur einen Fehler zurück
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox, filedialog
