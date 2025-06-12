@@ -12,6 +12,10 @@
 #   ausgegebenen Menge zur Konsistenzprüfung.
 # - Robuste Status-Visualisierung: Verfolgt den letzten Zeitstempel für
 #   Freeze/Thaw-Events, um den finalen Status korrekt darzustellen.
+# - KORREKTUR: Transaktionen werden nun nach Blockchain-Zeit (block_time)
+#   sortiert und geloggt, um die korrekte chronologische Reihenfolge
+#   sicherzustellen.
+# - KORREKTUR: Kompatibilität mit älteren solana-py Versionen wiederhergestellt.
 
 import time
 import json
@@ -22,7 +26,7 @@ import traceback
 import argparse
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Set, Dict
+from typing import Set, Dict, List
 
 # --- Benötigte Bibliotheken ---
 try:
@@ -172,69 +176,66 @@ class NetworkVisualizer:
         flows = defaultdict(float)
         wallet_freeze_status = {}  # {wallet: {'status': 'FROZEN'/'THAWED', 'timestamp': '...'}}
 
+        # Log-Datei lesen und Daten sammeln
+        log_entries = []
         with open(self.log_file, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
-                    tx = json.loads(line)
-                    status = tx.get('status')
-                    timestamp = tx.get('timestamp')
-
-                    # Verarbeite Transfers für Bilanzen und Flüsse
-                    if status in ['VIOLATION', 'AUTHORIZED_TRANSFER']:
-                        sender, recipient = tx.get('sender'), tx.get('recipient')
-                        amount = tx.get('amount', 0)
-                        if sender and recipient and amount > 0:
-                            all_wallets.update([sender, recipient])
-                            balances[sender] -= amount
-                            balances[recipient] += amount
-                            flows[(sender, recipient)] += amount
-                    
-                    # Verarbeite Freeze/Thaw-Events für den finalen Status
-                    wallet = None
-                    is_freeze_event = False
-                    if 'FROZEN' in status:
-                        wallet = tx.get('frozen_wallet')
-                        is_freeze_event = True
-                    elif 'THAWED' in status:
-                        wallet = tx.get('thawed_wallet')
-                    
-                    if wallet and timestamp:
-                        all_wallets.add(wallet)
-                        # Aktualisiere den Status nur, wenn der neue Event jünger ist
-                        if wallet not in wallet_freeze_status or timestamp > wallet_freeze_status[wallet]['timestamp']:
-                            wallet_freeze_status[wallet] = {
-                                'status': 'FROZEN' if is_freeze_event else 'THAWED',
-                                'timestamp': timestamp
-                            }
+                    log_entries.append(json.loads(line))
                 except (json.JSONDecodeError, IndexError):
                     continue
+
+        # Log-Einträge nach Zeitstempel sortieren, um die korrekte Reihenfolge sicherzustellen
+        log_entries.sort(key=lambda x: x.get('timestamp', ''))
+
+        for tx in log_entries:
+            try:
+                status = tx.get('status')
+                timestamp = tx.get('timestamp')
+
+                if status in ['VIOLATION', 'AUTHORIZED_TRANSFER']:
+                    sender, recipient = tx.get('sender'), tx.get('recipient')
+                    amount = tx.get('amount', 0)
+                    if sender and recipient and amount > 0:
+                        all_wallets.update([sender, recipient])
+                        balances[sender] -= amount
+                        balances[recipient] += amount
+                        flows[(sender, recipient)] += amount
+                
+                wallet = None
+                is_freeze_event = False
+                if 'FROZEN' in status:
+                    wallet = tx.get('frozen_wallet')
+                    is_freeze_event = True
+                elif 'THAWED' in status:
+                    wallet = tx.get('thawed_wallet')
+                
+                if wallet and timestamp:
+                    all_wallets.add(wallet)
+                    wallet_freeze_status[wallet] = {
+                        'status': 'FROZEN' if is_freeze_event else 'THAWED',
+                        'timestamp': timestamp
+                    }
+            except Exception:
+                continue
         
-        # Erstelle das Set der final gesperrten Wallets basierend auf dem letzten Event
         final_frozen_wallets = {
             wallet for wallet, data in wallet_freeze_status.items() if data['status'] == 'FROZEN'
         }
         
         net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=False, directed=True)
         
+        all_wallets.add(self.payer_address)
         for wallet in all_wallets:
-            color_whitelist = '#22C55E'       # Grün
-            color_greylist = '#FBBF24'       # Amber/Gelb
-            color_external = '#3B82F6'       # Blau (sollte nicht mehr vorkommen)
-            color_frozen = '#EF4444'          # Rot
-            color_payer = '#A855F7'           # Lila
-
-            color = color_external # Standard
-            status_text = 'Extern'
+            color_whitelist, color_greylist, color_frozen, color_payer = '#22C55E', '#FBBF24', '#EF4444', '#A855F7'
+            status_text = 'Extern' # Sollte nicht mehr vorkommen
 
             if wallet == self.payer_address:
-                color = color_payer
-                status_text = 'Payer'
+                color, status_text = color_payer, 'Payer'
             elif wallet in self.whitelist:
-                color = color_whitelist
-                status_text = 'Whitelist'
+                color, status_text = color_whitelist, 'Whitelist'
             elif wallet in self.greylist:
-                color = color_greylist
-                status_text = 'Greylist'
+                color, status_text = color_greylist, 'Greylist'
             
             if wallet in final_frozen_wallets:
                 color = color_frozen
@@ -278,8 +279,8 @@ class PeriodicChecker:
         self.whitelist: Set[str] = set()
         self.greylist: Set[str] = set()
 
-    def get_new_signatures_paginated(self, wallet_address: str, last_known_signature_str: str | None) -> list[Signature]:
-        all_new_signatures = []
+    def get_new_signatures_paginated(self, wallet_address: str, last_known_signature_str: str | None) -> List:
+        all_new_sig_infos = []
         before_sig = None
         limit = 1000
 
@@ -297,12 +298,12 @@ class PeriodicChecker:
                     if last_known_sig and sig_info.signature == last_known_sig:
                         found_last_known = True
                         break
-                    all_new_signatures.append(sig_info.signature)
+                    all_new_sig_infos.append(sig_info)
                 
                 if found_last_known or len(batch_signatures) < limit: break
                 before_sig = batch_signatures[-1].signature
             
-            return list(reversed(all_new_signatures))
+            return list(reversed(all_new_sig_infos))
         except Exception as e:
             main_logger.error(f"Fehler beim lückenlosen Abrufen der Signaturen für {wallet_address}: {e}")
             return []
@@ -324,22 +325,24 @@ class PeriodicChecker:
         main_logger.error(f"Konnte TX {signature} nach {max_retries} Versuchen wegen Ratenbegrenzung nicht laden.")
         return None
 
-    def analyze_transaction(self, signature: Signature, monitored_wallets: set):
+    def analyze_transaction(self, signature: Signature, block_time: int | None, monitored_wallets: set):
         tx_resp = self.get_transaction_with_retries(signature)
         
-        if not tx_resp:
+        if not tx_resp or not tx_resp.value or not tx_resp.value.transaction or not tx_resp.value.transaction.meta:
             main_logger.error(f"Analyse für TX {signature} übersprungen, da Details nicht geladen werden konnten.")
             return
 
+        if tx_resp.value.transaction.meta.err:
+            return
+
         try:
-            if not tx_resp.value or not tx_resp.value.transaction or not tx_resp.value.transaction.meta or tx_resp.value.transaction.meta.err:
-                return
-            
             tx = tx_resp.value.transaction
             tx_meta = tx.meta
+            
+            final_block_time = tx_resp.value.block_time or block_time
 
-            transfer_found = self._analyze_transfers(signature, tx_meta, monitored_wallets)
-            freeze_thaw_found = self._analyze_freeze_thaw(signature, tx, tx_meta)
+            transfer_found = self._analyze_transfers(signature, tx_meta, final_block_time, monitored_wallets)
+            freeze_thaw_found = self._analyze_freeze_thaw(signature, tx, tx_meta, final_block_time)
             
             if self.debug_mode and not transfer_found and not freeze_thaw_found:
                  main_logger.debug(f"-> Keine relevanten Aktionen für unseren Token in TX {signature} gefunden.")
@@ -353,18 +356,14 @@ class PeriodicChecker:
             ata_to_freeze = get_associated_token_address(wallet_to_freeze_pubkey, self.mint_pubkey)
             
             ix = freeze_account(FreezeAccountParams(
-                program_id=TOKEN_PROGRAM_ID,
-                account=ata_to_freeze,
-                mint=self.mint_pubkey,
-                authority=self.payer_keypair.pubkey()
+                program_id=TOKEN_PROGRAM_ID, account=ata_to_freeze,
+                mint=self.mint_pubkey, authority=self.payer_keypair.pubkey()
             ))
 
             latest_blockhash_resp = self.client.get_latest_blockhash()
             transaction = Transaction.new_signed_with_payer(
-                [ix],
-                self.payer_keypair.pubkey(),
-                [self.payer_keypair],
-                latest_blockhash_resp.value.blockhash
+                [ix], self.payer_keypair.pubkey(),
+                [self.payer_keypair], latest_blockhash_resp.value.blockhash
             )
             
             resp = self.client.send_transaction(transaction, opts=TxOpts(skip_confirmation=False, preflight_commitment="finalized"))
@@ -374,23 +373,22 @@ class PeriodicChecker:
             self.client.confirm_transaction(signature, "finalized")
             main_logger.info(f"✅ Freeze für Wallet {wallet_to_freeze_pubkey} erfolgreich bestätigt.")
             
-            self._log_event(str(signature), "ACCOUNT_FROZEN_BY_SCRIPT", frozen_wallet=str(wallet_to_freeze_pubkey))
+            self._log_event(str(signature), "ACCOUNT_FROZEN_BY_SCRIPT", None, frozen_wallet=str(wallet_to_freeze_pubkey))
             return True
-
         except Exception as e:
             main_logger.error(f"FEHLER beim Einfrieren von {wallet_to_freeze_pubkey}: {e}")
             return False
 
-    def _analyze_transfers(self, signature: Signature, tx_meta, monitored_wallets: set) -> bool:
-        if not any(hasattr(b, 'mint') and b.mint == self.mint_pubkey for b in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or [])):
+    def _analyze_transfers(self, signature: Signature, tx_meta, block_time: int | None, monitored_wallets: set) -> bool:
+        if not any(hasattr(b, 'mint') and str(b.mint) == str(self.mint_pubkey) for b in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or [])):
             return False
 
         owner_balances = defaultdict(lambda: 0)
         for pre in (tx_meta.pre_token_balances or []):
-            if hasattr(pre, 'owner') and hasattr(pre, 'mint') and pre.mint == self.mint_pubkey and hasattr(pre, 'ui_token_amount'):
+            if hasattr(pre, 'owner') and hasattr(pre, 'mint') and str(pre.mint) == str(self.mint_pubkey) and hasattr(pre, 'ui_token_amount'):
                 owner_balances[str(pre.owner)] -= int(pre.ui_token_amount.amount or 0)
         for post in (tx_meta.post_token_balances or []):
-            if hasattr(post, 'owner') and hasattr(post, 'mint') and post.mint == self.mint_pubkey and hasattr(post, 'ui_token_amount'):
+            if hasattr(post, 'owner') and hasattr(post, 'mint') and str(post.mint) == str(self.mint_pubkey) and hasattr(post, 'ui_token_amount'):
                 owner_balances[str(post.owner)] += int(post.ui_token_amount.amount or 0)
         
         sender, recipient, amount = None, None, 0
@@ -405,26 +403,23 @@ class PeriodicChecker:
                 main_logger.warning(f"-> Empfänger {recipient} wird zur Greylist hinzugefügt.")
                 self.greylist.add(recipient)
                 
-                if self.freeze_sender_on_violation:
-                    self._freeze_account(Pubkey.from_string(sender))
-                if self.freeze_recipient_on_violation:
-                    self._freeze_account(Pubkey.from_string(recipient))
+                if self.freeze_sender_on_violation: self._freeze_account(Pubkey.from_string(sender))
+                if self.freeze_recipient_on_violation: self._freeze_account(Pubkey.from_string(recipient))
             else:
                 status = 'AUTHORIZED_TRANSFER'
                 main_logger.debug(f"-> Transfer ({status}) in TX {signature}: {amount:.4f} von {sender} an {recipient}")
             
-            self._log_event(str(signature), status, sender=sender, recipient=recipient, amount=amount)
+            self._log_event(str(signature), status, block_time, sender=sender, recipient=recipient, amount=amount)
             return True
         return False
 
-    def _analyze_freeze_thaw(self, signature: Signature, tx, tx_meta) -> bool:
+    def _analyze_freeze_thaw(self, signature: Signature, tx, tx_meta, block_time: int | None) -> bool:
         action_found = False
         for instruction in tx.transaction.message.instructions:
-            if not hasattr(instruction, 'program_id') or instruction.program_id != TOKEN_PROGRAM_ID:
+            if not hasattr(instruction, 'program_id') or str(instruction.program_id) != str(TOKEN_PROGRAM_ID):
                 continue
             
             parsed_info = getattr(instruction, 'parsed', None)
-            
             instr_type = parsed_info.get('type') if isinstance(parsed_info, dict) else getattr(parsed_info, 'type', None)
             if instr_type not in ['freezeAccount', 'thawAccount']: continue
 
@@ -459,7 +454,7 @@ class PeriodicChecker:
             status = 'ACCOUNT_FROZEN' if instr_type == 'freezeAccount' else 'ACCOUNT_THAWED'
             main_logger.info(f"-> Aktion '{status}' in TX {signature} für Wallet {owner_address} entdeckt.")
             log_params = {'frozen_wallet': owner_address} if status == 'ACCOUNT_FROZEN' else {'thawed_wallet': owner_address}
-            self._log_event(str(signature), status, **log_params)
+            self._log_event(str(signature), status, block_time, **log_params)
         
         return action_found
 
@@ -483,7 +478,7 @@ class PeriodicChecker:
         wallets_with_balance = 0
         main_logger.info(f"[VALIDATION] Frage On-Chain-Bestände für {len(monitored_wallets)} überwachte Wallets ab...")
 
-        for i, wallet_str in enumerate(monitored_wallets):
+        for i, wallet_str in enumerate(sorted(list(monitored_wallets))):
             try:
                 if self.debug_mode or (i % 10 == 0):
                     main_logger.info(f"[VALIDATION] Frage Bestand ab für Wallet {i+1}/{len(monitored_wallets)}...")
@@ -511,9 +506,10 @@ class PeriodicChecker:
             main_logger.error(f"❌ [VALIDATION] FEHLGESCHLAGEN: Diskrepanz von {discrepancy:.4f} Tokens entdeckt!")
         main_logger.info("--- Validierungs-Check abgeschlossen ---")
 
-    def _log_event(self, signature: str, status: str, **kwargs):
+    def _log_event(self, signature: str, status: str, block_time: int | None, **kwargs):
+        ts = datetime.utcfromtimestamp(block_time).isoformat() + "Z" if block_time else datetime.utcnow().isoformat() + "Z"
         log_entry = {
-            'timestamp': datetime.utcnow().isoformat() + "Z", 
+            'timestamp': ts, 
             'signature': signature, 
             'status': status
         }
@@ -533,7 +529,7 @@ class PeriodicChecker:
             return
 
         scanned_wallets_in_run = set()
-        all_signatures_in_run = set()
+        all_signature_infos_in_run = {}  # Dict[Signature, object]
         processed_signatures_in_run = set()
         
         pass_num = 1
@@ -549,32 +545,35 @@ class PeriodicChecker:
                 
             main_logger.info(f"Scanne Signaturen für {len(wallets_to_scan_this_pass)} Wallet(s) in diesem Pass.")
 
-            for wallet_address in wallets_to_scan_this_pass:
+            for wallet_address in sorted(list(wallets_to_scan_this_pass)):
                 main_logger.debug(f"Prüfe Wallet: {wallet_address}")
-                new_signatures = self.get_new_signatures_paginated(wallet_address, state.get(wallet_address))
+                new_sig_infos = self.get_new_signatures_paginated(wallet_address, state.get(wallet_address))
                 
-                if new_signatures:
-                    main_logger.info(f"-> {len(new_signatures)} neue Transaktion(en) für {wallet_address} gefunden.")
-                    all_signatures_in_run.update(new_signatures)
-                    state[wallet_address] = str(new_signatures[-1])
+                if new_sig_infos:
+                    main_logger.info(f"-> {len(new_sig_infos)} neue Transaktion(en) für {wallet_address} gefunden.")
+                    for sig_info in new_sig_infos:
+                        if sig_info.signature not in all_signature_infos_in_run:
+                            all_signature_infos_in_run[sig_info.signature] = sig_info
+                    state[wallet_address] = str(new_sig_infos[-1].signature)
                 
                 scanned_wallets_in_run.add(wallet_address)
 
-            signatures_to_analyze_now = all_signatures_in_run - processed_signatures_in_run
+            signatures_to_process_keys = set(all_signature_infos_in_run.keys()) - processed_signatures_in_run
             
-            if not signatures_to_analyze_now:
+            if not signatures_to_process_keys:
                 main_logger.info("Keine neuen Transaktionen in diesem Pass zu analysieren.")
                 pass_num += 1
                 continue
                 
-            main_logger.info(f"Analysiere {len(signatures_to_analyze_now)} neue, einzigartige Transaktionen...")
+            main_logger.info(f"Analysiere {len(signatures_to_process_keys)} neue, einzigartige Transaktionen...")
             
             initial_greylist_size = len(self.greylist)
             
-            total_tx = len(signatures_to_analyze_now)
-            sorted_signatures = sorted(list(signatures_to_analyze_now), key=lambda s: str(s))
+            sig_infos_to_process = [all_signature_infos_in_run[sig] for sig in signatures_to_process_keys]
+            sorted_sig_infos = sorted(sig_infos_to_process, key=lambda si: si.block_time or 0)
             
-            for i, sig in enumerate(sorted_signatures):
+            total_tx = len(sorted_sig_infos)
+            for i, sig_info in enumerate(sorted_sig_infos):
                 if not self.debug_mode:
                     progress = (i + 1) / total_tx
                     bar_length = 40
@@ -583,11 +582,11 @@ class PeriodicChecker:
                     sys.stdout.write(f'\rPass #{pass_num} Fortschritt: [{bar}] {i+1}/{total_tx} ({progress:.0%})')
                     sys.stdout.flush()
                 else:
-                    main_logger.info(f"Analysiere TX {i+1} von {total_tx}: {sig}")
+                    main_logger.info(f"Analysiere TX {i+1} von {total_tx}: {sig_info.signature}")
 
                 analysis_monitored_set = self.whitelist.union(self.greylist)
-                self.analyze_transaction(sig, analysis_monitored_set)
-                processed_signatures_in_run.add(sig)
+                self.analyze_transaction(sig_info.signature, sig_info.block_time, analysis_monitored_set)
+                processed_signatures_in_run.add(sig_info.signature)
                 
             if not self.debug_mode:
                 sys.stdout.write('\n')
