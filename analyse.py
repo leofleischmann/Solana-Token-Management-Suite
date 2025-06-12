@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# === Periodischer Whitelist-Prüfer mit Netzwerk-Visualisierung ===
+# === Periodischer Whitelist-Prüfer mit Kaskadierendem Freeze ===
 # Kombiniert kostengünstige, periodische Abfragen mit detaillierter
 # Analyse und grafischer Darstellung aller relevanten Transaktionen.
 
@@ -10,8 +10,9 @@ import sys
 import logging
 import traceback
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
+from typing import Set
 
 # --- Benötigte Bibliotheken ---
 try:
@@ -19,9 +20,10 @@ try:
     from solders.pubkey import Pubkey
     from solders.signature import Signature
     from solana.rpc.api import Client
+    from solana.rpc.types import TxOpts
     from solana.exceptions import SolanaRpcException
     from httpx import HTTPStatusError
-    from spl.token.instructions import freeze_account, FreezeAccountParams
+    from spl.token.instructions import get_associated_token_address, freeze_account, FreezeAccountParams
     from spl.token.constants import TOKEN_PROGRAM_ID
     from solders.transaction import Transaction
     from pyvis.network import Network
@@ -48,7 +50,6 @@ if not CONFIG:
 
 RPC_URL = CONFIG.get("rpc_url")
 WALLET_FOLDER = CONFIG.get("wallet_folder")
-CHECK_INTERVAL_MINUTES = 15
 
 # --- Dateipfade im Unterordner "analyse" ---
 ANALYSE_FOLDER = "analyse"
@@ -200,7 +201,7 @@ class NetworkVisualizer:
             net.add_edge(sender, recipient, title=title, label=amount_str, value=total_amount)
 
         net.set_options("""
-        { "nodes": { "font": { "size": 14, "color": "#FFFFFF" } }, "edges": { "arrows": { "to": { "enabled": true, "scaleFactor": 0.7 } }, "color": { "inherit": false, "color": "#848484", "highlight": "#FFFFFF", "hover": "#FFFFFF" }, "font": { "size": 12, "color": "#FFFFFF", "align": "top" }, "smooth": { "type": "continuous" } }, "physics": { "barnesHut": { "gravitationalConstant": -40000, "centralGravity": 0.1, "springLength": 250, "springConstant": 0.05, "damping": 0.09, "avoidOverlap": 0.8 }, "minVelocity": 0.75, "solver": "barnesHut" }, "interaction": { "tooltipDelay": 200, "hideEdgesOnDrag": true, "hover": true } }
+        { "nodes": { "font": { "size": 14, "color": "#FFFFFF" } }, "edges": { "arrows": { "to": { "enabled": true, "scaleFactor": 0.7 } }, "color": { "inherit": false, "color": "#848484", "highlight": "#FFFFFF", "hover": "#FFFFFF" }, "font": { "size": 12, "color": "#FFFFFF", "align": "top" }, "smooth": { "type": "continuous" } }, "physics": { "barnesHut": { "gravitationalConstant": -80000, "centralGravity": 0.3, "springLength": 400, "springConstant": 0.09, "damping": 0.09, "avoidOverlap": 1 }, "minVelocity": 0.75, "solver": "barnesHut" }, "interaction": { "tooltipDelay": 200, "hideEdgesOnDrag": true, "hover": true } }
         """)
 
         try:
@@ -211,53 +212,47 @@ class NetworkVisualizer:
 
 # --- Kernlogik ---
 class PeriodicChecker:
-    def __init__(self, debug_mode=False):
+    def __init__(self, debug_mode=False, freeze_sender=False, freeze_recipient=False):
         self.debug_mode = debug_mode
+        self.freeze_sender_on_violation = freeze_sender
+        self.freeze_recipient_on_violation = freeze_recipient
+        
         self.client = Client(RPC_URL)
         main_logger.info(f"Verbunden mit RPC-Endpunkt: {RPC_URL}")
         self.payer_keypair = load_keypair("payer-wallet.json")
-        self.mint_pubkey = load_keypair("mint-wallet.json").pubkey()
+        self.mint_keypair = load_keypair("mint-wallet.json")
+        self.mint_pubkey = self.mint_keypair.pubkey()
+        
+        self.processed_in_chain = set()
 
     def get_new_signatures_paginated(self, wallet_address: str, last_known_signature_str: str | None) -> list[Signature]:
-        """Holt alle neuen Signaturen lückenlos seit dem letzten bekannten Punkt."""
         all_new_signatures = []
         before_sig = None
-        limit = 1000  # Maximales Limit der Solana API
+        limit = 1000
 
         try:
             pubkey = Pubkey.from_string(wallet_address)
             last_known_sig = Signature.from_string(last_known_signature_str) if last_known_signature_str else None
 
             while True:
-                signatures_resp = self.client.get_signatures_for_address(
-                    pubkey,
-                    limit=limit,
-                    before=before_sig
-                )
-
-                if not signatures_resp.value:
-                    break
+                signatures_resp = self.client.get_signatures_for_address(pubkey, limit=limit, before=before_sig)
+                if not signatures_resp.value: break
 
                 batch_signatures = signatures_resp.value
                 found_last_known = False
-
                 for sig_info in batch_signatures:
                     if last_known_sig and sig_info.signature == last_known_sig:
                         found_last_known = True
                         break
                     all_new_signatures.append(sig_info.signature)
                 
-                if found_last_known or len(batch_signatures) < limit:
-                    break
-
+                if found_last_known or len(batch_signatures) < limit: break
                 before_sig = batch_signatures[-1].signature
             
             return list(reversed(all_new_signatures))
-
         except Exception as e:
             main_logger.error(f"Fehler beim lückenlosen Abrufen der Signaturen für {wallet_address}: {e}")
             return []
-
 
     def get_transaction_with_retries(self, signature: Signature, max_retries=3):
         for attempt in range(max_retries):
@@ -295,12 +290,46 @@ class PeriodicChecker:
             
             if self.debug_mode and not transfer_found and not freeze_thaw_found:
                  main_logger.debug(f"-> Keine relevanten Aktionen für unseren Token in TX {signature} gefunden.")
-
         except Exception:
             main_logger.error(f"Unerwarteter Fehler bei der Analyse von TX {signature}:")
             main_logger.error(traceback.format_exc())
 
-    def _analyze_transfers(self, signature: Signature, tx_meta, whitelist: set) -> bool:
+    def _freeze_account(self, wallet_to_freeze_pubkey: Pubkey):
+        main_logger.warning(f"Leite Freeze-Aktion für Wallet {wallet_to_freeze_pubkey} ein...")
+        try:
+            ata_to_freeze = get_associated_token_address(wallet_to_freeze_pubkey, self.mint_pubkey)
+            
+            ix = freeze_account(FreezeAccountParams(
+                program_id=TOKEN_PROGRAM_ID,
+                account=ata_to_freeze,
+                mint=self.mint_pubkey,
+                authority=self.payer_keypair.pubkey()
+            ))
+
+            latest_blockhash_resp = self.client.get_latest_blockhash()
+            transaction = Transaction.new_signed_with_payer(
+                [ix],
+                self.payer_keypair.pubkey(),
+                [self.payer_keypair],
+                latest_blockhash_resp.value.blockhash
+            )
+            
+            resp = self.client.send_transaction(transaction, opts=TxOpts(skip_confirmation=False, preflight_commitment="finalized"))
+            signature = resp.value
+            
+            main_logger.info(f"Freeze-Transaktion gesendet. Signatur: {signature}")
+            self.client.confirm_transaction(signature, "finalized")
+            main_logger.info(f"✅ Freeze für Wallet {wallet_to_freeze_pubkey} erfolgreich bestätigt.")
+            
+            self._log_event(str(signature), "ACCOUNT_FROZEN_BY_SCRIPT", frozen_wallet=str(wallet_to_freeze_pubkey))
+            return True
+
+        except Exception as e:
+            main_logger.error(f"FEHLER beim Einfrieren von {wallet_to_freeze_pubkey}: {e}")
+            return False
+
+    def _analyze_transfers(self, signature: Signature, tx_meta, whitelist: set, is_chain_trace=False) -> bool:
+        """Analysiert eine Transaktion auf Transfers und gibt True zurück, wenn ein relevanter Transfer gefunden wurde."""
         if not any(hasattr(b, 'mint') and b.mint == self.mint_pubkey for b in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or [])):
             return False
 
@@ -318,11 +347,76 @@ class PeriodicChecker:
             elif change > 0: recipient = owner
         
         if sender and recipient and amount > 0:
-            status = 'AUTHORIZED_TRANSFER' if recipient in whitelist else 'VIOLATION'
-            main_logger.info(f"-> Transfer ({status}) in TX {signature}: {amount:.4f} von {sender} an {recipient}")
+            if recipient not in whitelist:
+                status = 'VIOLATION'
+                main_logger.warning(f"-> VERSTOSS in TX {signature}: {amount:.4f} von {sender} an {recipient}")
+                
+                # Nur bei der initialen Analyse die Freeze-Aktionen auslösen, nicht in der Kettenverfolgung selbst
+                if not is_chain_trace:
+                    if self.freeze_sender_on_violation:
+                        self._freeze_account(Pubkey.from_string(sender))
+                    if self.freeze_recipient_on_violation:
+                        self._trace_and_freeze_violation_chain(recipient, whitelist)
+            else:
+                status = 'AUTHORIZED_TRANSFER'
+                main_logger.debug(f"-> Transfer ({status}) in TX {signature}: {amount:.4f} von {sender} an {recipient}")
+            
             self._log_event(str(signature), status, sender=sender, recipient=recipient, amount=amount)
             return True
         return False
+
+    def _trace_and_freeze_violation_chain(self, initial_recipient: str, whitelist: set):
+        """Verfolgt die Kette einer nicht autorisierten Transaktion und friert alle beteiligten Konten ein."""
+        main_logger.warning(f"Starte Kettenverfolgung für initialen Empfänger: {initial_recipient}")
+        
+        queue_to_process = deque([initial_recipient])
+        
+        while queue_to_process:
+            current_wallet_address = queue_to_process.popleft()
+            
+            if current_wallet_address in self.processed_in_chain:
+                continue
+
+            self.processed_in_chain.add(current_wallet_address)
+            
+            main_logger.info(f"Kettenverfolgung: Verarbeite Wallet {current_wallet_address}")
+            self._freeze_account(Pubkey.from_string(current_wallet_address))
+            
+            main_logger.info(f"Kettenverfolgung: Rufe Historie für {current_wallet_address} ab...")
+            wallet_signatures = self.get_new_signatures_paginated(current_wallet_address, None)
+            
+            for sig in wallet_signatures:
+                tx_resp = self.get_transaction_with_retries(sig)
+                if not tx_resp or not tx_resp.value or not tx_resp.value.transaction: continue
+                
+                # Finde Weiterleitungen von der aktuellen Wallet und logge sie
+                # Die `_analyze_transfers`-Methode wird mit `is_chain_trace=True` aufgerufen,
+                # um sie zu loggen, aber keine weitere Kettenverfolgung zu starten.
+                tx_meta = tx_resp.value.transaction.meta
+                self._analyze_transfers(sig, tx_meta, whitelist, is_chain_trace=True)
+
+                # Finde neue, nicht autorisierte Empfänger und füge sie der Warteschlange hinzu
+                if not any(hasattr(b, 'mint') and b.mint == self.mint_pubkey for b in (tx_meta.pre_token_balances or [])):
+                    continue
+
+                tx_owner_balances = defaultdict(lambda: 0)
+                for pre in (tx_meta.pre_token_balances or []):
+                    if hasattr(pre, 'owner') and hasattr(pre, 'mint') and pre.mint == self.mint_pubkey and hasattr(pre, 'ui_token_amount'):
+                        tx_owner_balances[str(pre.owner)] -= int(pre.ui_token_amount.amount or 0)
+                for post in (tx_meta.post_token_balances or []):
+                    if hasattr(post, 'owner') and hasattr(post, 'mint') and post.mint == self.mint_pubkey and hasattr(post, 'ui_token_amount'):
+                        tx_owner_balances[str(post.owner)] += int(post.ui_token_amount.amount or 0)
+
+                tx_sender, tx_recipient = None, None
+                for owner, change in tx_owner_balances.items():
+                    if change < 0: tx_sender = owner
+                    elif change > 0: tx_recipient = owner
+
+                if tx_sender == current_wallet_address and tx_recipient and tx_recipient not in whitelist:
+                    main_logger.warning(f"Kettenverfolgung: {current_wallet_address} hat Tokens an weitere nicht-autorisierte Adresse {tx_recipient} gesendet.")
+                    if tx_recipient not in self.processed_in_chain:
+                        queue_to_process.append(tx_recipient)
+
 
     def _analyze_freeze_thaw(self, signature: Signature, tx, tx_meta) -> bool:
         action_found = False
@@ -376,6 +470,7 @@ class PeriodicChecker:
 
     def run_check(self):
         main_logger.info("Starte periodische Prüfung...")
+        self.processed_in_chain.clear()
         whitelist = load_whitelist()
         state = load_state()
         
@@ -385,11 +480,11 @@ class PeriodicChecker:
 
         all_new_signatures = []
         for wallet_address in whitelist:
-            main_logger.info(f"Prüfe Wallet: {wallet_address}")
+            main_logger.debug(f"Prüfe Wallet: {wallet_address}")
             new_signatures = self.get_new_signatures_paginated(wallet_address, state.get(wallet_address))
             
             if not new_signatures:
-                main_logger.info(f"-> Keine neuen Transaktionen für {wallet_address} gefunden.")
+                main_logger.debug(f"-> Keine neuen Transaktionen für {wallet_address} gefunden.")
                 continue
 
             main_logger.info(f"-> {len(new_signatures)} neue Transaktion(en) für {wallet_address} gefunden.")
@@ -427,19 +522,24 @@ class PeriodicChecker:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Periodischer Solana Whitelist-Prüfer mit Netzwerk-Visualisierung.")
     parser.add_argument("--debug", action="store_true", help="Aktiviert detaillierte Debug-Ausgaben in der Konsole.")
+    parser.add_argument("--interval", type=int, default=15, help="Prüfungsintervall in Minuten (Standard: 15).")
+    parser.add_argument("--freezesend", action="store_true", help="Friert den Sender bei einem Whitelist-Verstoß ein.")
+    parser.add_argument("--freezereceive", action="store_true", help="Friert den Empfänger und alle nachfolgenden nicht-autorisierten Empfänger bei einem Verstoß ein.")
     args = parser.parse_args()
 
     main_logger = setup_logger('main_checker', MAIN_LOG_FILE, debug_mode=args.debug)
     os.makedirs(ANALYSE_FOLDER, exist_ok=True)
     
-    checker = PeriodicChecker(debug_mode=args.debug)
+    checker = PeriodicChecker(debug_mode=args.debug, freeze_sender=args.freezesend, freeze_recipient=args.freezereceive)
+    
     while True:
         try:
             checker.run_check()
+            interval = args.interval
             if not args.debug:
-                 print(f"Prüfung um {datetime.now().strftime('%H:%M:%S')} abgeschlossen. Nächste Prüfung in {CHECK_INTERVAL_MINUTES} Minuten.")
-            main_logger.info(f"Warte für {CHECK_INTERVAL_MINUTES} Minuten bis zur nächsten Prüfung.")
-            time.sleep(CHECK_INTERVAL_MINUTES * 60)
+                 print(f"\nPrüfung um {datetime.now().strftime('%H:%M:%S')} abgeschlossen. Nächste Prüfung in {interval} Minuten.")
+            main_logger.info(f"Warte für {interval} Minuten bis zur nächsten Prüfung.")
+            time.sleep(interval * 60)
         except KeyboardInterrupt:
             main_logger.info("\nSkript wird durch Benutzer beendet.")
             sys.exit(0)
