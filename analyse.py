@@ -16,6 +16,9 @@
 #   sortiert und geloggt, um die korrekte chronologische Reihenfolge
 #   sicherzustellen.
 # - KORREKTUR: Kompatibilität mit älteren solana-py Versionen wiederhergestellt.
+# - OPTIMIERUNG: Neue Greylist-Wallets werden nur ab dem Zeitpunkt ihres
+#   ersten Kontakts mit dem Token analysiert, nicht mehr die gesamte Historie.
+# - KORREKTUR: Absturz ('AttributeError') durch fehlerhafte Status-Update-Logik behoben.
 
 import time
 import json
@@ -325,7 +328,7 @@ class PeriodicChecker:
         main_logger.error(f"Konnte TX {signature} nach {max_retries} Versuchen wegen Ratenbegrenzung nicht laden.")
         return None
 
-    def analyze_transaction(self, signature: Signature, block_time: int | None, monitored_wallets: set):
+    def analyze_transaction(self, signature: Signature, block_time: int | None, monitored_wallets: set, state: dict):
         tx_resp = self.get_transaction_with_retries(signature)
         
         if not tx_resp or not tx_resp.value or not tx_resp.value.transaction or not tx_resp.value.transaction.meta:
@@ -341,7 +344,7 @@ class PeriodicChecker:
             
             final_block_time = tx_resp.value.block_time or block_time
 
-            transfer_found = self._analyze_transfers(signature, tx_meta, final_block_time, monitored_wallets)
+            transfer_found = self._analyze_transfers(signature, tx_meta, final_block_time, monitored_wallets, state)
             freeze_thaw_found = self._analyze_freeze_thaw(signature, tx, tx_meta, final_block_time)
             
             if self.debug_mode and not transfer_found and not freeze_thaw_found:
@@ -379,7 +382,7 @@ class PeriodicChecker:
             main_logger.error(f"FEHLER beim Einfrieren von {wallet_to_freeze_pubkey}: {e}")
             return False
 
-    def _analyze_transfers(self, signature: Signature, tx_meta, block_time: int | None, monitored_wallets: set) -> bool:
+    def _analyze_transfers(self, signature: Signature, tx_meta, block_time: int | None, monitored_wallets: set, state: dict) -> bool:
         if not any(hasattr(b, 'mint') and str(b.mint) == str(self.mint_pubkey) for b in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or [])):
             return False
 
@@ -402,6 +405,9 @@ class PeriodicChecker:
                 main_logger.warning(f"-> VERSTOSS in TX {signature}: {amount:.4f} von {truncate_address(sender)} an {truncate_address(recipient)}")
                 main_logger.warning(f"-> Empfänger {recipient} wird zur Greylist hinzugefügt.")
                 self.greylist.add(recipient)
+                state[recipient] = str(signature)
+                main_logger.info(f"-> Setze Startpunkt für neue Greylist-Wallet {truncate_address(recipient)} auf TX {signature}")
+
                 
                 if self.freeze_sender_on_violation: self._freeze_account(Pubkey.from_string(sender))
                 if self.freeze_recipient_on_violation: self._freeze_account(Pubkey.from_string(recipient))
@@ -585,9 +591,9 @@ class PeriodicChecker:
                     main_logger.info(f"Analysiere TX {i+1} von {total_tx}: {sig_info.signature}")
 
                 analysis_monitored_set = self.whitelist.union(self.greylist)
-                self.analyze_transaction(sig_info.signature, sig_info.block_time, analysis_monitored_set)
+                self.analyze_transaction(sig_info.signature, sig_info.block_time, analysis_monitored_set, state)
                 processed_signatures_in_run.add(sig_info.signature)
-                
+            
             if not self.debug_mode:
                 sys.stdout.write('\n')
 
