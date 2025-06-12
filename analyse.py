@@ -19,6 +19,7 @@
 # - OPTIMIERUNG: Neue Greylist-Wallets werden nur ab dem Zeitpunkt ihres
 #   ersten Kontakts mit dem Token analysiert, nicht mehr die gesamte Historie.
 # - KORREKTUR: Absturz ('AttributeError') durch fehlerhafte Status-Update-Logik behoben.
+# - KORREKTUR: Validierungs-Check zieht den Bestand des Payer-Wallets ab.
 
 import time
 import json
@@ -481,6 +482,7 @@ class PeriodicChecker:
         main_logger.info(f"[VALIDATION] Laut Log-Datei wurden {total_distributed:.4f} Tokens vom Payer verteilt.")
 
         total_on_chain_balance = 0
+        payer_on_chain_balance = 0
         wallets_with_balance = 0
         main_logger.info(f"[VALIDATION] Frage On-Chain-Bestände für {len(monitored_wallets)} überwachte Wallets ab...")
 
@@ -493,9 +495,16 @@ class PeriodicChecker:
                 ata = get_associated_token_address(wallet_pubkey, self.mint_pubkey)
                 balance_resp = self.client.get_token_account_balance(ata)
                 
+                current_balance = 0
                 if balance_resp.value and balance_resp.value.ui_amount is not None:
-                    total_on_chain_balance += balance_resp.value.ui_amount
+                    current_balance = balance_resp.value.ui_amount
+                    total_on_chain_balance += current_balance
                     wallets_with_balance += 1
+                
+                # Speichere den Bestand des Payer-Wallets separat
+                if wallet_str == payer_address:
+                    payer_on_chain_balance = current_balance
+
                 time.sleep(0.1)
             except SolanaRpcException:
                 main_logger.debug(f"[VALIDATION] Token-Konto für {wallet_str} nicht gefunden, Bestand ist 0.")
@@ -504,10 +513,14 @@ class PeriodicChecker:
 
         main_logger.info(f"[VALIDATION] {wallets_with_balance} von {len(monitored_wallets)} Wallets halten Tokens.")
         main_logger.info(f"[VALIDATION] Summe der On-Chain-Bestände in überwachten Wallets: {total_on_chain_balance:.4f} Tokens.")
+        main_logger.info(f"[VALIDATION] Davon liegen {payer_on_chain_balance:.4f} Tokens noch im Payer-Wallet.")
         
-        discrepancy = abs(total_distributed - total_on_chain_balance)
+        circulating_supply = total_on_chain_balance - payer_on_chain_balance
+        main_logger.info(f"[VALIDATION] Effektiver Token-Umlauf (ohne Payer): {circulating_supply:.4f} Tokens.")
+
+        discrepancy = abs(total_distributed - circulating_supply)
         if discrepancy < 1e-4:
-            main_logger.info(f"✅ [VALIDATION] ERFOLGREICH: Die verteilte Menge stimmt mit den On-Chain-Beständen überein.")
+            main_logger.info(f"✅ [VALIDATION] ERFOLGREICH: Die verteilte Menge stimmt mit dem effektiven Umlauf überein.")
         else:
             main_logger.error(f"❌ [VALIDATION] FEHLGESCHLAGEN: Diskrepanz von {discrepancy:.4f} Tokens entdeckt!")
         main_logger.info("--- Validierungs-Check abgeschlossen ---")
@@ -613,7 +626,9 @@ class PeriodicChecker:
         visualizer.generate_graph()
         
         if self.perform_validation:
+            # Stelle sicher, dass das Payer-Wallet auch Teil der Validierung ist
             final_monitored_wallets = self.whitelist.union(self.greylist)
+            final_monitored_wallets.add(payer_address)
             self._perform_supply_validation(final_monitored_wallets)
 
         main_logger.info("Prüfungslauf abgeschlossen.")
