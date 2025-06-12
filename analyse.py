@@ -10,6 +10,8 @@
 #   um die gesamte Transaktionskette sofort zu verfolgen.
 # - Validierungs-Check: Vergleicht die Summe der Token-Bestände mit der
 #   ausgegebenen Menge zur Konsistenzprüfung.
+# - Robuste Status-Visualisierung: Verfolgt den letzten Zeitstempel für
+#   Freeze/Thaw-Events, um den finalen Status korrekt darzustellen.
 
 import time
 import json
@@ -31,7 +33,7 @@ try:
     from solana.rpc.types import TxOpts, TokenAccountOpts
     from solana.exceptions import SolanaRpcException
     from httpx import HTTPStatusError
-    from spl.token.instructions import get_associated_token_address, freeze_account, FreezeAccountParams
+    from spl.token.instructions import get_associated_token_address, freeze_account, FreezeAccountParams, thaw_account, ThawAccountParams
     from spl.token.constants import TOKEN_PROGRAM_ID
     from solders.transaction import Transaction
     from pyvis.network import Network
@@ -79,7 +81,6 @@ def setup_logger(name, log_file, level=logging.INFO, debug_mode=False):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
 
-    # Verhindern, dass Handler dupliziert werden
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -91,7 +92,6 @@ def setup_logger(name, log_file, level=logging.INFO, debug_mode=False):
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
-    # Verhindern, dass Logs an den Root-Logger weitergegeben werden
     logger.propagate = False
 
     return logger
@@ -167,16 +167,18 @@ class NetworkVisualizer:
             main_logger.info("Keine Log-Datei für Visualisierung gefunden. Überspringe.")
             return
 
-        all_wallets, final_frozen_wallets = set(), set()
+        all_wallets = set()
         balances = defaultdict(float)
         flows = defaultdict(float)
+        wallet_freeze_status = {}  # {wallet: {'status': 'FROZEN'/'THAWED', 'timestamp': '...'}}
 
         with open(self.log_file, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     tx = json.loads(line)
                     status = tx.get('status')
-                    
+                    timestamp = tx.get('timestamp')
+
                     # Verarbeite Transfers für Bilanzen und Flüsse
                     if status in ['VIOLATION', 'AUTHORIZED_TRANSFER']:
                         sender, recipient = tx.get('sender'), tx.get('recipient')
@@ -188,19 +190,29 @@ class NetworkVisualizer:
                             flows[(sender, recipient)] += amount
                     
                     # Verarbeite Freeze/Thaw-Events für den finalen Status
+                    wallet = None
+                    is_freeze_event = False
                     if 'FROZEN' in status:
-                        wallet_to_freeze = tx.get('frozen_wallet')
-                        if wallet_to_freeze: 
-                            final_frozen_wallets.add(wallet_to_freeze)
-                            all_wallets.add(wallet_to_freeze)
-                            
+                        wallet = tx.get('frozen_wallet')
+                        is_freeze_event = True
                     elif 'THAWED' in status:
-                        wallet_to_thaw = tx.get('thawed_wallet')
-                        if wallet_to_thaw and wallet_to_thaw in final_frozen_wallets:
-                            final_frozen_wallets.remove(wallet_to_thaw)
-
+                        wallet = tx.get('thawed_wallet')
+                    
+                    if wallet and timestamp:
+                        all_wallets.add(wallet)
+                        # Aktualisiere den Status nur, wenn der neue Event jünger ist
+                        if wallet not in wallet_freeze_status or timestamp > wallet_freeze_status[wallet]['timestamp']:
+                            wallet_freeze_status[wallet] = {
+                                'status': 'FROZEN' if is_freeze_event else 'THAWED',
+                                'timestamp': timestamp
+                            }
                 except (json.JSONDecodeError, IndexError):
                     continue
+        
+        # Erstelle das Set der final gesperrten Wallets basierend auf dem letzten Event
+        final_frozen_wallets = {
+            wallet for wallet, data in wallet_freeze_status.items() if data['status'] == 'FROZEN'
+        }
         
         net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=False, directed=True)
         
@@ -387,8 +399,6 @@ class PeriodicChecker:
             elif change > 0: recipient = owner
         
         if sender and recipient and amount > 0:
-            # Ein Verstoß liegt vor, wenn der Empfänger weder auf der White- noch auf der Greylist ist.
-            # Wichtig: `monitored_wallets` ist der aktuelle Stand aus dem jeweiligen Analyse-Pass
             if recipient not in monitored_wallets:
                 status = 'VIOLATION'
                 main_logger.warning(f"-> VERSTOSS in TX {signature}: {amount:.4f} von {truncate_address(sender)} an {truncate_address(recipient)}")
@@ -428,9 +438,7 @@ class PeriodicChecker:
 
             action_found = True
             owner_address = None
-            # Versuche, den Owner aus den Token Balances zu finden (effizienter)
             for tb in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or []):
-                # Die account_keys sind als strings (base58) oder Pubkey-Objekte vorhanden
                 account_keys_str = [str(k) for k in tx.transaction.message.account_keys]
                 if hasattr(tb, 'account_index') and tb.account_index < len(account_keys_str) and account_keys_str[tb.account_index] == ata_address:
                     owner_address = str(getattr(tb, 'owner', None))
@@ -458,7 +466,6 @@ class PeriodicChecker:
     def _perform_supply_validation(self, monitored_wallets: set):
         main_logger.info("--- Starte optionalen Validierungs-Check der Token-Menge ---")
         
-        # 1. Berechne die vom Payer verteilte Menge aus den Logs
         total_distributed = 0
         payer_address = str(self.payer_keypair.pubkey())
         if os.path.exists(TRANSACTION_LOG_FILE):
@@ -472,7 +479,6 @@ class PeriodicChecker:
                         continue
         main_logger.info(f"[VALIDATION] Laut Log-Datei wurden {total_distributed:.4f} Tokens vom Payer verteilt.")
 
-        # 2. Hole die aktuellen Bestände aller überwachten Wallets via RPC
         total_on_chain_balance = 0
         wallets_with_balance = 0
         main_logger.info(f"[VALIDATION] Frage On-Chain-Bestände für {len(monitored_wallets)} überwachte Wallets ab...")
@@ -489,9 +495,8 @@ class PeriodicChecker:
                 if balance_resp.value and balance_resp.value.ui_amount is not None:
                     total_on_chain_balance += balance_resp.value.ui_amount
                     wallets_with_balance += 1
-                time.sleep(0.1) # Ratenbegrenzung respektieren
+                time.sleep(0.1)
             except SolanaRpcException:
-                # Konto existiert wahrscheinlich nicht (mehr), was ok ist.
                 main_logger.debug(f"[VALIDATION] Token-Konto für {wallet_str} nicht gefunden, Bestand ist 0.")
             except Exception as e:
                 main_logger.error(f"[VALIDATION] Fehler beim Abrufen des Saldos für {wallet_str}: {e}")
@@ -499,16 +504,19 @@ class PeriodicChecker:
         main_logger.info(f"[VALIDATION] {wallets_with_balance} von {len(monitored_wallets)} Wallets halten Tokens.")
         main_logger.info(f"[VALIDATION] Summe der On-Chain-Bestände in überwachten Wallets: {total_on_chain_balance:.4f} Tokens.")
         
-        # 3. Vergleiche die Werte
         discrepancy = abs(total_distributed - total_on_chain_balance)
-        if discrepancy < 1e-4: # Toleranz für Fließkomma-Ungenauigkeiten
+        if discrepancy < 1e-4:
             main_logger.info(f"✅ [VALIDATION] ERFOLGREICH: Die verteilte Menge stimmt mit den On-Chain-Beständen überein.")
         else:
             main_logger.error(f"❌ [VALIDATION] FEHLGESCHLAGEN: Diskrepanz von {discrepancy:.4f} Tokens entdeckt!")
         main_logger.info("--- Validierungs-Check abgeschlossen ---")
 
     def _log_event(self, signature: str, status: str, **kwargs):
-        log_entry = {'timestamp': datetime.utcnow().isoformat(), 'signature': signature, 'status': status}
+        log_entry = {
+            'timestamp': datetime.utcnow().isoformat() + "Z", 
+            'signature': signature, 
+            'status': status
+        }
         log_entry.update(kwargs)
         transaction_logger.info(json.dumps(log_entry))
 
@@ -516,26 +524,22 @@ class PeriodicChecker:
         main_logger.info("="*50)
         main_logger.info(f"Starte Prüfungslauf um {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # 1. Initialisierung
         self.whitelist = load_whitelist()
         self.greylist = load_greylist()
         state = load_state()
         
         if not self.whitelist:
-            main_logger.warning("Whitelist ist leer. Prüfung wird übersprungen, da kein Startpunkt vorhanden ist.")
+            main_logger.warning("Whitelist ist leer. Prüfung wird übersprungen.")
             return
 
-        # Sets zur Nachverfolgung des Fortschritts innerhalb dieses Laufs
         scanned_wallets_in_run = set()
         all_signatures_in_run = set()
         processed_signatures_in_run = set()
         
         pass_num = 1
-        # 2. Multi-Pass-Schleife: Läuft, solange im vorherigen Pass neue Wallets entdeckt wurden
         while True:
             main_logger.info(f"--- Starte Analyse-Pass #{pass_num} ---")
             
-            # 3. Bestimme, welche Wallets in diesem Pass gescannt werden müssen
             current_monitored_set = self.whitelist.union(self.greylist)
             wallets_to_scan_this_pass = current_monitored_set - scanned_wallets_in_run
             
@@ -545,7 +549,6 @@ class PeriodicChecker:
                 
             main_logger.info(f"Scanne Signaturen für {len(wallets_to_scan_this_pass)} Wallet(s) in diesem Pass.")
 
-            # 4. Sammle Signaturen für die neuen Wallets
             for wallet_address in wallets_to_scan_this_pass:
                 main_logger.debug(f"Prüfe Wallet: {wallet_address}")
                 new_signatures = self.get_new_signatures_paginated(wallet_address, state.get(wallet_address))
@@ -557,7 +560,6 @@ class PeriodicChecker:
                 
                 scanned_wallets_in_run.add(wallet_address)
 
-            # 5. Analysiere nur die neu hinzugekommenen Signaturen
             signatures_to_analyze_now = all_signatures_in_run - processed_signatures_in_run
             
             if not signatures_to_analyze_now:
@@ -590,14 +592,12 @@ class PeriodicChecker:
             if not self.debug_mode:
                 sys.stdout.write('\n')
 
-            # 6. Prüfe, ob neue Wallets zur Greylist hinzugefügt wurden. Wenn ja, wird die Schleife fortgesetzt.
             if len(self.greylist) == initial_greylist_size:
                 main_logger.info("In diesem Pass wurden keine neuen Greylist-Wallets entdeckt. Beende den Prüfungslauf.")
                 break
             
             pass_num += 1
 
-        # 7. Aufräumen und Speichern nach Abschluss aller Pässe
         main_logger.info("Alle Analyse-Pässe abgeschlossen. Speichere finalen Status.")
         save_state(state)
         save_greylist(self.greylist)
@@ -624,7 +624,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Logger initial einrichten
     main_logger = setup_logger('main_checker', MAIN_LOG_FILE, debug_mode=args.debug)
     os.makedirs(ANALYSE_FOLDER, exist_ok=True)
     
