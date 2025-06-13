@@ -98,6 +98,98 @@ Der Whitelist-Monitor ist ein leistungsstarkes Werkzeug zur Überwachung und Dur
 
 ---
 
+# Solana Advanced Traffic Generator
+
+Ein Python-basiertes Kommandozeilen-Tool zur Erzeugung von komplexen und mehrstufigen SPL-Token-Transfers im Solana-Netzwerk. Das Tool dient dazu, Transaktionsmuster zu generieren, die die Nachverfolgbarkeit von Token-Bewegungen durch zufällige Operationen und die dynamische Erstellung von Wallets erschweren. Es ist primär für den Einsatz auf Devnet oder Testnet konzipiert.
+
+## Kernfunktionalität und Modi
+
+Das Tool operiert hauptsächlich durch die Simulation von Token-Transfers, wobei es zwischen zwei grundlegenden Modi unterscheidet:
+
+### 1. Standard-Modus (Interner Netzwerkverkehr)
+
+*   **Aktivierung:** Wird verwendet, wenn der Parameter `--outside` auf `0` gesetzt ist oder nicht explizit angegeben wird.
+*   **Funktionsweise:**
+    1.  **Wallet-Auswahl:** Wählt zufällig ein Sender-Wallet und ein Empfänger-Wallet aus einem vordefinierten Pool von Wallets. Diese initialen Wallets werden aus dem Ordner `devnet_wallets` geladen.
+    2.  **Guthabenprüfung:** Überprüft, ob das Sender-Wallet über ausreichend SPL-Token-Guthaben für den Mindesttransfer verfügt.
+    3.  **Betragsermittlung:** Bestimmt eine zufällige Menge an Tokens für den Transfer, die zwischen den über die Kommandozeilenparameter `--min` und `--max` definierten Grenzen liegt.
+    4.  **SOL-Prüfung und -Finanzierung:** Überprüft das SOL-Guthaben des Sender-Wallets. Falls es für die Transaktionsgebühren (insbesondere wenn das Payer-Wallet nicht alle Gebühren übernimmt oder für ATA-Erstellung) zu niedrig ist, wird es vom Haupt-Payer-Wallet (`payer-wallet.json`) mit einer kleinen Menge SOL aufgeladen.
+    5.  **ATA-Management:** Vor dem Transfer wird geprüft, ob das Empfänger-Wallet bereits ein Associated Token Account (ATA) für den betreffenden SPL-Token besitzt. Ist dies nicht der Fall, wird automatisch ein ATA für den Empfänger erstellt. Die Gebühr hierfür wird vom Sender-Wallet getragen (daher die SOL-Finanzierung).
+    6.  **Token-Transfer:** Führt den SPL-Token-Transfer (`transfer_checked`) vom Sender-ATA zum Empfänger-ATA durch. Die Transaktionsgebühr wird vom Haupt-Payer-Wallet bezahlt.
+    7.  **Logging:** Alle Aktionen, insbesondere die Transaktionssignaturen, werden protokolliert.
+*   **Zweck:** Simuliert kontinuierliche, interne Handelsaktivität oder Bewegungen innerhalb eines bekannten Wallet-Netzwerks.
+
+### 2. Outside-Modus (Mehrstufige Verschleierung und Netzwerkexpansion)
+
+*   **Aktivierung:** Wird durch den Parameter `--outside N` aktiviert, wobei `N` die Anzahl der gewünschten "Hops" angibt.
+*   **Funktionsweise:** Dieser Modus ist in mehrere Phasen unterteilt:
+
+    *   **Phase 0: Zufällige Aktivität im bestehenden Handelsnetzwerk (optional)**
+        *   Mit einer gewissen Wahrscheinlichkeit (aktuell 70% Chance, *keine* neue Kette zu starten, wenn ein Handelsnetzwerk existiert) führt das Tool zuerst einen Transfer im "Standard-Modus" durch, jedoch unter Verwendung der Wallets, die in früheren "Outside-Modus"-Durchläufen in der Verzweigungsphase erstellt wurden (gespeichert in `generic_transactions/generated_wallets/layer_N+1`). Dies simuliert Aktivität in den bereits etablierten, "verschleierten" Netzwerken.
+
+    *   **Phase 1: Hop-Kette (Verschleierung)**
+        1.  **Initialer Sender:** Wählt ein zufälliges Wallet aus dem initialen Pool (`devnet_wallets`) als Startpunkt.
+        2.  **Betragsermittlung:** Bestimmt einen signifikanten Anteil (zufällig zwischen 50-90%) des Token-Guthabens des initialen Senders für die Hop-Kette.
+        3.  **Iterative Hops:** Für jede der `N` Hops:
+            *   Ein **neues temporäres Wallet** (`Keypair`) wird generiert und dessen Schlüsselmaterial in einem `layer_X`-Unterordner gespeichert (`X` ist die Hop-Nummer).
+            *   Dieses neue Wallet wird vom Haupt-Payer-Wallet mit SOL aufgeladen, um zukünftige Transaktionsgebühren (für den nächsten Hop oder die ATA-Erstellung) zu decken.
+            *   Der zuvor bestimmte Token-Betrag wird vom Wallet des vorherigen Hops an dieses neu erstellte Hop-Wallet transferiert. Dabei wird bei Bedarf ein ATA für das neue Hop-Wallet erstellt (bezahlt vom sendenden Hop-Wallet).
+            *   Das neu erstellte Wallet wird zum Sender für den nächsten Hop.
+        4.  **Ergebnis:** Nach `N` Hops befindet sich der Token-Betrag in einem Wallet, das `N` Schritte vom ursprünglichen Sender entfernt ist, wobei jeder Zwischenschritt über ein frisch erstelltes Wallet lief.
+
+    *   **Phase 2: Verzweigung (Distribution & Netzwerkexpansion)**
+        1.  **Verteiler-Wallet:** Das Wallet am Ende der Hop-Kette (`layer_N`) fungiert nun als "Verteiler"-Wallet.
+        2.  **Netzwerkgröße:** Die Anzahl der neuen Wallets, auf die verteilt wird, wird entweder durch `--network-size` fest vorgegeben oder zufällig bestimmt (Standard: 2-4).
+        3.  **SOL-Finanzierung des Verteilers:** Das Verteiler-Wallet wird vom Haupt-Payer-Wallet mit ausreichend SOL aufgeladen, um die Gebühren für die Erstellung der ATAs für alle neuen Zweig-Wallets zu decken.
+        4.  **Token-Aufteilung:** Das gesamte Token-Guthaben des Verteiler-Wallets wird gleichmäßig auf die festgelegte Anzahl neuer Zweige aufgeteilt.
+        5.  **Erstellung der Zweig-Wallets:** Für jeden Zweig:
+            *   Ein **neues Wallet** (`Keypair`) wird erstellt und im Ordner `generic_transactions/generated_wallets/layer_N+1` gespeichert.
+            *   Der anteilige Token-Betrag wird vom Verteiler-Wallet an dieses neue Zweig-Wallet transferiert. Dabei wird ein ATA für das Zweig-Wallet erstellt (bezahlt vom Verteiler-Wallet).
+            *   Das neu erstellte Zweig-Wallet wird ebenfalls vom Haupt-Payer-Wallet mit einer kleinen Menge SOL für zukünftige Transaktionen ausgestattet.
+            *   Diese neu erstellten Zweig-Wallets werden dem Pool `outside_network_wallets` hinzugefügt, um in zukünftigen Läufen für die "zufällige Aktivität" (Phase 0 des Outside-Modus) genutzt zu werden.
+
+*   **Zweck:** Erzeugt komplexe Transaktionspfade, die schwerer zu verfolgen sind, und baut dynamisch neue kleine Netzwerke von Wallets auf, in denen weitere Aktivität simuliert werden kann.
+
+## Technische Details und Hilfsfunktionen
+
+*   **Wallet-Management (`load_keypair_from_path`, `create_and_save_keypair`, `load_all_keypairs`):**
+    *   Kann Solana-Keypairs aus JSON-Dateien laden, die entweder im alten Format (Liste von Bytes) oder im neueren Base64-String-Format vorliegen.
+    *   Generiert neue Keypairs und speichert sie als Base64-String des 64-Byte-Schlüssels in einer JSON-Datei, benannt nach dem Pubkey des Wallets.
+    *   Verwaltet das Laden ganzer Wallet-Sammlungen aus Ordnern.
+
+*   **Token-Operationen (`get_token_balance`, `send_token_transfer`):**
+    *   `get_token_balance`: Ruft den SPL-Token-Kontostand eines Wallets ab. Implementiert eine Retry-Logik, falls das zugehörige Token-Konto (ATA) nicht sofort gefunden wird (z.B. aufgrund von RPC-Verzögerungen nach der Erstellung).
+    *   `send_token_transfer`: Ist die Kernfunktion für SPL-Token-Überweisungen.
+        *   Ermittelt die ATAs für Sender und Empfänger.
+        *   Prüft, ob das ATA des Empfängers existiert. Falls nicht, wird eine `create_associated_token_account`-Instruktion zur Transaktion hinzugefügt. Die Gebühr für die ATA-Erstellung wird vom `sender` (nicht vom globalen `payer`) der `send_token_transfer`-Funktion getragen.
+        *   Fügt die `transfer_checked`-Instruktion hinzu.
+        *   Bündelt die Instruktionen, signiert die Transaktion mit dem Haupt-`payer` (für die Netzwerkgebühr) und dem `sender` (als Token-Owner und ggf. Payer der ATA-Erstellung) und sendet sie.
+        *   Bestätigt die Transaktion und gibt die Signatur zurück.
+        *   Enthält eine Retry-Logik für den Abruf der Kontoinformationen des Empfänger-ATAs.
+
+*   **SOL-Finanzierung (`fund_with_sol`):**
+    *   Überweist eine konfigurierbare Menge SOL vom Haupt-Payer-Wallet an ein Ziel-Wallet. Dies ist notwendig, damit neu erstellte Wallets Transaktionsgebühren bezahlen oder ATAs erstellen können.
+
+*   **RPC-Kommunikation und Fehlerbehandlung:**
+    *   Verwendet die `solana-py`-Bibliothek für die Interaktion mit einem Solana RPC-Knoten.
+    *   Verwendet konsistent das Commitment-Level `"confirmed"` für das Senden von Transaktionen und das Abrufen von Zustandsdaten, um Konsistenz zu gewährleisten.
+    *   Die Initialisierung des RPC-Clients ist für ältere Versionen von `solana-py` (z.B. 0.36.6) angepasst, die keine expliziten erweiterten Timeout-Konfigurationen im Konstruktor erlauben.
+    *   Eine globale Schleife im `main`-Teil fängt allgemeine Fehler und spezifische `SolanaRpcException` ab, wartet eine gewisse Zeit und versucht dann, den Zyklus fortzusetzen.
+
+*   **Logging (`setup_logger`, `TRANSACTION_LOG_FILE`):**
+    *   Alle wichtigen Aktionen, erstellte Wallets, gesendete Transaktionen (mit Signaturen) und Fehler werden sowohl auf der Konsole ausgegeben als auch in die Datei `generic_transactions/sent_transactions.log` geschrieben.
+    *   Neu erstellte Wallets werden in strukturierten Unterordnern unter `generic_transactions/generated_wallets/layer_X` gespeichert.
+
+*   **Konfiguration (`config.json`, Kommandozeilenargumente):**
+    *   Grundlegende Konfigurationen wie RPC-URL und der Pfad zum Ordner mit Payer-/Mint-Wallet erfolgen über `config.json`.
+    *   Dynamische Parameter wie Verzögerungen, Transferbeträge und Modus-spezifische Einstellungen (Hops, Netzwerkgröße) werden über Kommandozeilenargumente gesteuert.
+
+Dieses Tool bietet eine flexible Möglichkeit, verschiedene Szenarien von Token-Bewegungen auf der Solana-Blockchain zu simulieren und zu untersuchen.
+
+![Management-Tool Hauptansicht](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/network_graph.png?raw=true)
+
+---
+
 ## Installation
 
 Folgen Sie diesen Schritten, um das Projekt lokal einzurichten.
