@@ -186,7 +186,7 @@ Das Tool operiert hauptsächlich durch die Simulation von Token-Transfers, wobei
 
 Dieses Tool bietet eine flexible Möglichkeit, verschiedene Szenarien von Token-Bewegungen auf der Solana-Blockchain zu simulieren und zu untersuchen.
 
-![Management-Tool Hauptansicht](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/f4e116df408867a4688febeaabdb81e83cfa6cb2/network_graph.png?raw=true)
+![Netzwerk Graph](https://github.com/leofleischmann/Solana-Token-Management-Suite/blob/d8643a08f2968ea695fb08e3e0a3a6c1935797c4/network_graph.png)
 
 ---
 
