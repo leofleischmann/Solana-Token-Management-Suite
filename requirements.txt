@@ -4,7 +4,8 @@
 # Für die Interaktion mit der Solana-Blockchain, Transaktionen und Tokens.
 solana==0.36.6
 solders==0.26.0
-spl-token==0.6.0        # Notwendig für SPL-Token-Operationen (freeze, mint, etc.).
+anchorpy==0.21.0
+anchorpy-core==0.2.0
 borsh-construct==0.1.0  # Wird in setup.py zur Serialisierung von Metadaten verwendet.
 
 # --- Graphical User Interface (GUI) ---
