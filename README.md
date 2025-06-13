@@ -460,7 +460,7 @@ Einige Funktionalitäten und Konzepte werden von mehreren Tools in der Suite gen
 
 1.  **Repository klonen:**
     ```bash
-    git clone https://github.com/DEIN_BENUTZERNAME/Solana-Token-Management-Suite.git
+    git clone https://github.com/leofleischmann/Solana-Token-Management-Suite.git
     cd Solana-Token-Management-Suite
     ```
 2.  **Virtuelle Umgebung erstellen (Empfohlen):**
