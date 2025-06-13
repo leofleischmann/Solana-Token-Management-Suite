@@ -1,49 +1,39 @@
 #!/usr/bin/env python3
-# === Periodischer Whitelist-Prüfer mit Greylist und lückenloser Kette ===
-# Kombiniert kostengünstige, periodische Abfragen mit detaillierter
-# Analyse und grafischer Darstellung aller relevanten Transaktionen.
-#
-# Neu in dieser Version:
-# - KORREKTUR (ROBUSTE OPTIMIERUNG): Die Kontostand-Optimierung wurde um einen
-#   Sicherheits-Check erweitert. Bei gleichem Kontostand wird zusätzlich
-#   die letzte On-Chain-Signatur geprüft, um Race Conditions mit RPC-Knoten
-#   und Hin-/Rück-Transaktionen zuverlässig zu erkennen.
-# - KORREKTUR (TRANSFERS): Die Transfer-Analyse wurde überarbeitet, um auch
-#   komplexe Transaktionen mit mehreren Sendern/Empfängern korrekt zu
-#   verarbeiten und keine Verstöße mehr zu übersehen.
-# - Greylist-Konzept: Wallets, die Token von überwachten Konten erhalten,
-#   werden zur Greylist hinzugefügt und permanent überwacht.
-# - Lückenlose Überwachung durch Multi-Pass-Analyse.
-# - Validierungs-Check: Vergleicht die Summe der Token-Bestände mit der
-#   ausgegebenen Menge zur Konsistenzprüfung.
+# === Solana Advanced Traffic Generator ===
+# Erzeugt zufällige und mehrstufige SPL-Token-Transfers, 
+# um die Nachverfolgbarkeit zu erschweren.
 
 import time
 import json
 import os
 import sys
 import logging
-import traceback
+import random
 import argparse
-from collections import defaultdict
-from datetime import datetime
-from typing import Set, Dict, List, Any
+import base64
+import binascii
+from typing import List, Optional
 
-# --- Benötigte Bibliotheken ---
+# --- Solana-Bibliotheken ---
 try:
     from solders.keypair import Keypair
     from solders.pubkey import Pubkey
-    from solders.signature import Signature
-    from solana.rpc.api import Client
-    from solana.rpc.types import TxOpts
-    from solana.exceptions import SolanaRpcException
-    from httpx import HTTPStatusError
-    from spl.token.instructions import get_associated_token_address, freeze_account, FreezeAccountParams, thaw_account, ThawAccountParams
-    from spl.token.constants import TOKEN_PROGRAM_ID
     from solders.transaction import Transaction
-    from pyvis.network import Network
+    from solders.system_program import transfer, TransferParams
+    from solana.rpc.api import Client
+    # from solana.rpc.types import TxOpts, Commitment, GetAccountInfoOpts # For newer solana-py
+    from solana.rpc.types import TxOpts, Commitment # Adjusted for solana==0.36.6
+    from solana.rpc.core import RPCException
+    from solana.exceptions import SolanaRpcException
+    from spl.token.instructions import get_associated_token_address, create_associated_token_account, transfer_checked, TransferCheckedParams
+    from spl.token.constants import TOKEN_PROGRAM_ID
+    import httpx 
 except ImportError as e:
-    print(f"Fehler: Eine oder mehrere erforderliche Bibliotheken fehlen: {e}.")
-    print("Bitte installieren Sie diese mit: pip install solders solana spl-token pyvis httpx")
+    print(f"Fehler: Eine oder mehrere erforderliche Bibliotheken fehlen oder sind nicht kompatibel: {e}.")
+    print("Stellen Sie sicher, dass die korrekten Versionen installiert sind. Für die vom Nutzer gewünschten Versionen:")
+    print("pip install solders==0.26.0 solana==0.36.6 spl-token==0.6.0 httpx")
+    print("Alternativ können Sie versuchen, auf die neuesten Versionen zu aktualisieren (erfordert möglicherweise Code-Anpassungen):")
+    print("pip install --upgrade solders solana spl-token httpx")
     sys.exit(1)
 
 # --- Konfiguration ---
@@ -63,541 +53,547 @@ if not CONFIG:
     sys.exit(1)
 
 RPC_URL = CONFIG.get("rpc_url")
-WALLET_FOLDER = CONFIG.get("wallet_folder")
+CONFIG_WALLET_FOLDER = CONFIG.get("wallet_folder")
 
-# --- Dateipfade im Unterordner "analyse" ---
-ANALYSE_FOLDER = "analyse"
-STATE_FILE = os.path.join(ANALYSE_FOLDER, "last_signatures.json")
-GREYLIST_FILE = os.path.join(ANALYSE_FOLDER, "greylist.json")
-TRANSACTION_LOG_FILE = os.path.join(ANALYSE_FOLDER, "transactions.jsonl")
-VISUALIZATION_FILE = os.path.join(ANALYSE_FOLDER, "network_visualization.html")
-MAIN_LOG_FILE = os.path.join(ANALYSE_FOLDER, "checker_main.log")
-TOKEN_DECIMALS = 9
+# --- Ordner-Konstanten ---
+WALLET_SOURCE_FOLDER = "devnet_wallets" # Whitelist-Wallets
+LOG_FOLDER = "generic_transactions"
+GENERATED_WALLET_FOLDER = os.path.join(LOG_FOLDER, "generated_wallets") # Ordner für neue Wallets
+TRANSACTION_LOG_FILE = os.path.join(LOG_FOLDER, "sent_transactions.log")
 
 # --- Logging Setup ---
-def setup_logger(name, log_file, level=logging.INFO, debug_mode=False):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+def setup_logger():
+    os.makedirs(LOG_FOLDER, exist_ok=True)
     
-    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-
+    logger = logging.getLogger('traffic_generator')
+    logger.setLevel(logging.INFO) 
+    
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_formatter)
-    console_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    stream_handler.setFormatter(stream_formatter)
     
-    logger.propagate = False
+    file_handler = logging.FileHandler(TRANSACTION_LOG_FILE, mode='a', encoding='utf-8')
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+    
     return logger
 
-main_logger = logging.getLogger('main_checker')
+logger = setup_logger()
 
-transaction_logger = logging.getLogger('transaction_logger')
-if not transaction_logger.hasHandlers():
-    transaction_logger.setLevel(logging.INFO)
-    os.makedirs(os.path.dirname(TRANSACTION_LOG_FILE), exist_ok=True)
-    jsonl_handler = logging.FileHandler(TRANSACTION_LOG_FILE, mode='a', encoding='utf-8')
-    transaction_logger.addHandler(jsonl_handler)
-    transaction_logger.propagate = False
-
-# --- Hilfsfunktionen ---
-def load_keypair(filename: str):
-    path = os.path.join(WALLET_FOLDER, filename)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Wallet-Datei '{path}' nicht gefunden.")
-    with open(path, 'r') as f:
-        return Keypair.from_bytes(bytes(json.load(f)))
-
-def load_whitelist() -> set:
-    path = os.path.join(WALLET_FOLDER, "whitelist.txt")
-    if not os.path.exists(path):
-        main_logger.warning("whitelist.txt nicht gefunden, leere Whitelist wird verwendet.")
-        return set()
-    with open(path, 'r', encoding='utf-8') as f:
-        return {line.strip() for line in f if line.strip() and not line.startswith('#')}
-
-def load_greylist() -> set:
-    if not os.path.exists(GREYLIST_FILE):
-        return set()
-    try:
-        with open(GREYLIST_FILE, 'r') as f:
-            return set(json.load(f))
-    except (json.JSONDecodeError, TypeError):
-        main_logger.error(f"{GREYLIST_FILE} ist korrupt. Eine neue Greylist wird erstellt.")
-        return set()
-
-def save_greylist(greylist_data: set):
-    with open(GREYLIST_FILE, 'w') as f:
-        json.dump(sorted(list(greylist_data)), f, indent=4)
-
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        main_logger.error(f"{STATE_FILE} ist korrupt. Ein neuer Status wird erstellt.")
-        return {}
-
-def save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=4)
-
+# --- Wallet- und Hilfsfunktionen ---
 def truncate_address(address: str, chars: int = 4) -> str:
-    if not isinstance(address, str) or len(address) < chars * 2: return address
+    """Kürzt eine Adresse zur besseren Darstellung."""
+    if not isinstance(address, str) or len(address) < chars * 2:
+        return address
     return f"{address[:chars]}...{address[-chars:]}"
 
-# --- Visualisierung ---
-class NetworkVisualizer:
-    def __init__(self, log_file: str, whitelist: set, greylist: set, payer_address: str):
-        self.log_file = log_file
-        self.whitelist = whitelist
-        self.greylist = greylist
-        self.payer_address = payer_address
+def load_keypair_from_path(path: str) -> Keypair:
+    """Lädt ein Keypair aus einer JSON-Datei (unterstützt altes Listen- und neues Base64-Format)."""
+    with open(path, 'r') as f:
+        data = json.load(f)
 
-    def generate_graph(self):
-        if not os.path.exists(self.log_file):
-            main_logger.info("Keine Log-Datei für Visualisierung gefunden. Überspringe.")
-            return
+    if isinstance(data, str):
+        try:
+            b64_secret = data.encode('ascii')
+            secret_bytes = base64.b64decode(b64_secret)
+            if len(secret_bytes) != 64:
+                 raise ValueError(f"Dekodierter Base64-Schlüssel aus {path} hat eine falsche Länge: {len(secret_bytes)}")
+            return Keypair.from_bytes(secret_bytes)
+        except (ValueError, binascii.Error) as e:
+            logger.error(f"Fehler beim Dekodieren des Base64-Schlüssels in {path}: {e}")
+            raise e
 
-        all_wallets = set()
-        balances = defaultdict(float)
-        flows = defaultdict(float)
-        wallet_freeze_status = {}
+    elif isinstance(data, list):
+        try:
+            secret_bytes = bytes(data)
+            if len(secret_bytes) == 32: # Old format from_seed
+                # In solders 0.26.0, from_seed expects a list of 32 u8s, not bytes directly.
+                # Keypair.from_seed expects List[int] or bytes of length 32
+                # However, from_bytes(bytes_of_length_64) is more common for full keypairs
+                # If it's a 32-byte seed, we need to handle it properly.
+                # The original code did: Keypair.from_bytes(Keypair.from_seed(secret_bytes).to_bytes())
+                # This seems correct if secret_bytes is a 32-byte seed.
+                kp_from_seed = Keypair.from_seed(secret_bytes)
+                return Keypair.from_bytes(kp_from_seed.to_bytes())
+            elif len(secret_bytes) == 64: # Standard full keypair bytes
+                return Keypair.from_bytes(secret_bytes)
+            else:
+                 raise ValueError(f"Schlüssel aus Liste in {path} hat eine falsche Länge: {len(secret_bytes)}")
+        except ValueError as e:
+            logger.error(f"Fehler beim Verarbeiten des alten Schlüsselformats in {path}: {e}")
+            raise e
+    else:
+        raise TypeError(f"Unbekanntes oder ungültiges Key-Format in {path}.")
 
-        log_entries = []
-        with open(self.log_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    log_entries.append(json.loads(line))
-                except (json.JSONDecodeError, IndexError):
-                    continue
-
-        log_entries.sort(key=lambda x: x.get('timestamp', ''))
-
-        for tx in log_entries:
+def load_all_keypairs(folder_path: str) -> List[Keypair]:
+    keypairs = []
+    if not os.path.isdir(folder_path):
+        logger.warning(f"Wallet-Ordner '{folder_path}' nicht gefunden!")
+        return []
+    
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".json"):
             try:
-                status = tx.get('status')
-                timestamp = tx.get('timestamp')
-
-                if status in ['VIOLATION', 'AUTHORIZED_TRANSFER']:
-                    sender, recipient = tx.get('sender'), tx.get('recipient')
-                    amount = tx.get('amount', 0)
-                    if sender and recipient and amount > 0 and "Multiple" not in sender:
-                        all_wallets.update([sender, recipient])
-                        balances[sender] -= amount
-                        balances[recipient] += amount
-                        flows[(sender, recipient)] += amount
-                
-                wallet = None
-                if 'FROZEN' in status:
-                    wallet = tx.get('frozen_wallet')
-                    wallet_freeze_status[wallet] = {'status': 'FROZEN', 'timestamp': timestamp}
-                elif 'THAWED' in status:
-                    wallet = tx.get('thawed_wallet')
-                    wallet_freeze_status[wallet] = {'status': 'THAWED', 'timestamp': timestamp}
-                
-                if wallet: all_wallets.add(wallet)
-
-            except Exception:
-                continue
-        
-        final_frozen_wallets = {w for w, d in wallet_freeze_status.items() if d['status'] == 'FROZEN'}
-        
-        net = Network(height="95vh", width="100%", bgcolor="#222222", font_color="white", notebook=False, directed=True)
-        
-        all_wallets.add(self.payer_address)
-        for wallet in all_wallets:
-            color, status_text = '#848484', 'Extern'
-            if wallet == self.payer_address: color, status_text = '#A855F7', 'Payer'
-            elif wallet in self.whitelist: color, status_text = '#22C55E', 'Whitelist'
-            elif wallet in self.greylist: color, status_text = '#FBBF24', 'Greylist'
-            
-            if wallet in final_frozen_wallets:
-                color = '#EF4444'
-                status_text += ' / Gesperrt'
-
-            balance_str = f"{balances[wallet]:.4f}".rstrip('0').rstrip('.')
-            title = (f"Wallet: {wallet}<br>"
-                     f"<b>Berechneter Kontostand: {balance_str} Tokens</b><br>"
-                     f"Status: {status_text}")
-            net.add_node(wallet, label=truncate_address(wallet), title=title, color=color)
-
-        for (sender, recipient), total_amount in flows.items():
-            amount_str = f"{total_amount:.4f}".rstrip('0').rstrip('.')
-            title = f"Gesamtvolumen: {amount_str} Tokens"
-            net.add_edge(sender, recipient, title=title, label=amount_str, value=total_amount)
-
-        net.set_options("""
-        {"nodes":{"font":{"size":14,"color":"#FFFFFF"}},"edges":{"arrows":{"to":{"enabled":true,"scaleFactor":0.7}},"color":{"inherit":false,"color":"#848484","highlight":"#FFFFFF","hover":"#FFFFFF"},"font":{"size":12,"color":"#FFFFFF","align":"top"},"smooth":{"type":"continuous"}},"physics":{"barnesHut":{"gravitationalConstant":-80000,"centralGravity":0.3,"springLength":400,"springConstant":0.09,"damping":0.09,"avoidOverlap":1},"minVelocity":0.75,"solver":"barnesHut"},"interaction":{"tooltipDelay":200,"hideEdgesOnDrag":true,"hover":true}}
-        """)
-
-        try:
-            net.save_graph(VISUALIZATION_FILE)
-            main_logger.info(f"Netzwerk-Visualisierung aktualisiert: {VISUALIZATION_FILE}")
-        except Exception as e:
-            main_logger.error(f"Fehler beim Speichern der Visualisierung: {e}")
-
-# --- Kernlogik ---
-class PeriodicChecker:
-    def __init__(self, debug_mode=False, freeze_sender=False, freeze_recipient=False, validate=False):
-        self.debug_mode = debug_mode
-        self.freeze_sender_on_violation = freeze_sender
-        self.freeze_recipient_on_violation = freeze_recipient
-        self.perform_validation = validate
-        
-        self.client = Client(RPC_URL)
-        main_logger.info(f"Verbunden mit RPC-Endpunkt: {RPC_URL}")
-        self.payer_keypair = load_keypair("payer-wallet.json")
-        self.mint_keypair = load_keypair("mint-wallet.json")
-        self.mint_pubkey = self.mint_keypair.pubkey()
-        
-        self.whitelist: Set[str] = set()
-        self.greylist: Set[str] = set()
-
-    def get_token_balance(self, wallet_str: str) -> float | None:
-        try:
-            wallet_pubkey = Pubkey.from_string(wallet_str)
-            ata = get_associated_token_address(wallet_pubkey, self.mint_pubkey)
-            balance_resp = self.client.get_token_account_balance(ata)
-            return balance_resp.value.ui_amount if balance_resp.value else 0.0
-        except SolanaRpcException:
-            return 0.0
-        except Exception as e:
-            main_logger.error(f"Kritischer Fehler beim Abrufen des Saldos für {wallet_str}: {e}")
-            return None
-
-    def get_new_signatures_paginated(self, wallet_address: str, last_known_signature_str: str | None) -> List:
-        all_new_sig_infos = []
-        before_sig = None
-        limit = 1000
-        try:
-            pubkey = Pubkey.from_string(wallet_address)
-            last_known_sig = Signature.from_string(last_known_signature_str) if last_known_signature_str else None
-
-            while True:
-                signatures_resp = self.client.get_signatures_for_address(pubkey, limit=limit, before=before_sig)
-                if not signatures_resp.value: break
-                batch = signatures_resp.value
-                found_last = any(last_known_sig and si.signature == last_known_sig for si in batch)
-                
-                for si in batch:
-                    if last_known_sig and si.signature == last_known_sig: break
-                    all_new_sig_infos.append(si)
-                
-                if found_last or len(batch) < limit: break
-                before_sig = batch[-1].signature
-            
-            return list(reversed(all_new_sig_infos))
-        except Exception as e:
-            main_logger.error(f"Fehler beim lückenlosen Abrufen der Signaturen für {wallet_address}: {e}")
-            return []
-
-    def get_transaction_with_retries(self, signature: Signature, max_retries=3):
-        for attempt in range(max_retries):
-            try:
-                time.sleep(0.35)
-                return self.client.get_transaction(signature, max_supported_transaction_version=0, encoding="jsonParsed")
-            except SolanaRpcException as e:
-                if isinstance(e.__cause__, HTTPStatusError) and e.__cause__.response.status_code == 429:
-                    wait = 2 ** (attempt + 1)
-                    main_logger.warning(f"Ratenbegrenzung bei TX {signature}. Warte {wait}s...")
-                    time.sleep(wait)
-                else:
-                    main_logger.error(f"RPC-Fehler für TX {signature}: {e}")
-                    return None
-        main_logger.error(f"Konnte TX {signature} nach {max_retries} Versuchen nicht laden.")
-        return None
-
-    def analyze_transaction(self, signature: Signature, block_time: int | None, monitored_wallets: set, state: dict):
-        tx_resp = self.get_transaction_with_retries(signature)
-        if not (tx_resp and tx_resp.value and tx_resp.value.transaction and tx_resp.value.transaction.meta):
-            main_logger.error(f"Analyse für TX {signature} übersprungen: Details nicht geladen.")
-            return
-        if tx_resp.value.transaction.meta.err: return
-
-        try:
-            tx = tx_resp.value.transaction
-            tx_meta = tx.meta
-            final_block_time = tx_resp.value.block_time or block_time
-            self._analyze_transfers(signature, tx_meta, final_block_time, monitored_wallets, state)
-            self._analyze_freeze_thaw(signature, tx, final_block_time)
-        except Exception:
-            main_logger.error(f"Unerwarteter Fehler bei der Analyse von TX {signature}:\n{traceback.format_exc()}")
-
-    def _freeze_account(self, wallet_to_freeze_pubkey: Pubkey):
-        main_logger.warning(f"Leite Freeze-Aktion für Wallet {wallet_to_freeze_pubkey} ein...")
-        try:
-            ata = get_associated_token_address(wallet_to_freeze_pubkey, self.mint_pubkey)
-            ix = freeze_account(FreezeAccountParams(program_id=TOKEN_PROGRAM_ID, account=ata, mint=self.mint_pubkey, authority=self.payer_keypair.pubkey()))
-            latest_hash = self.client.get_latest_blockhash().value.blockhash
-            tx = Transaction.new_signed_with_payer([ix], self.payer_keypair.pubkey(), [self.payer_keypair], latest_hash)
-            sig = self.client.send_transaction(tx, opts=TxOpts(skip_confirmation=False)).value
-            self.client.confirm_transaction(sig, "finalized")
-            main_logger.info(f"✅ Freeze für Wallet {wallet_to_freeze_pubkey} bestätigt. Signatur: {sig}")
-            self._log_event(str(sig), "ACCOUNT_FROZEN_BY_SCRIPT", None, frozen_wallet=str(wallet_to_freeze_pubkey))
-        except Exception as e:
-            main_logger.error(f"FEHLER beim Einfrieren von {wallet_to_freeze_pubkey}: {e}")
-
-    def _process_transfer(self, signature: str, block_time: int | None, monitored: set, state: dict, sender: str, recipient: str, amount: float):
-        if recipient not in monitored:
-            status = 'VIOLATION'
-            main_logger.warning(f"-> VERSTOSS in TX {signature}: {amount:.4f} von {truncate_address(sender)} an {truncate_address(recipient)}")
-            main_logger.warning(f"-> Empfänger {recipient} wird zur Greylist hinzugefügt.")
-            self.greylist.add(recipient)
-            
-            if recipient not in state or not isinstance(state.get(recipient), dict):
-                state[recipient] = {}
-            state[recipient]['last_sig'] = signature
-            main_logger.info(f"-> Setze Startpunkt für neue Greylist-Wallet {truncate_address(recipient)} auf TX {signature}")
-            
-            if self.freeze_sender_on_violation and "Multiple" not in sender:
-                self._freeze_account(Pubkey.from_string(sender))
-            if self.freeze_recipient_on_violation:
-                self._freeze_account(Pubkey.from_string(recipient))
-        else:
-            status = 'AUTHORIZED_TRANSFER'
-            main_logger.debug(f"-> Transfer ({status}) in TX {signature}: {amount:.4f} von {sender} an {recipient}")
-        
-        self._log_event(signature, status, block_time, sender=sender, recipient=recipient, amount=amount)
-
-    def _analyze_transfers(self, signature: Signature, tx_meta, block_time: int | None, monitored: set, state: dict):
-        if not any(hasattr(b, 'mint') and str(b.mint) == str(self.mint_pubkey) for b in (tx_meta.pre_token_balances or []) + (tx_meta.post_token_balances or [])):
-            return
-
-        owner_balances = defaultdict(int)
-        for tb in (tx_meta.pre_token_balances or []):
-            if hasattr(tb, 'owner') and str(getattr(tb, 'mint', '')) == str(self.mint_pubkey):
-                owner_balances[str(tb.owner)] -= int(getattr(tb.ui_token_amount, 'amount', 0))
-        for tb in (tx_meta.post_token_balances or []):
-            if hasattr(tb, 'owner') and str(getattr(tb, 'mint', '')) == str(self.mint_pubkey):
-                owner_balances[str(tb.owner)] += int(getattr(tb.ui_token_amount, 'amount', 0))
-        
-        senders = {owner: -change for owner, change in owner_balances.items() if change < 0}
-        recipients = {owner: change for owner, change in owner_balances.items() if change > 0}
-        
-        if not senders or not recipients: return
-
-        sig_str = str(signature)
-        if len(senders) == 1 and len(recipients) == 1:
-            sender, s_amt = list(senders.items())[0]
-            recipient, r_amt = list(recipients.items())[0]
-            if abs(s_amt - r_amt) < 1:
-                self._process_transfer(sig_str, block_time, monitored, state, sender, recipient, float(r_amt) / (10**TOKEN_DECIMALS))
-        else:
-            main_logger.debug(f"-> Komplexe TX {sig_str}: {len(senders)} Sender, {len(recipients)} Empfänger.")
-            all_sender_keys = ", ".join([truncate_address(s) for s in senders.keys()])
-            sender_str = list(senders.keys())[0] if len(senders) == 1 else f"Multiple ({all_sender_keys})"
-            for recipient, amount_raw in recipients.items():
-                self._process_transfer(sig_str, block_time, monitored, state, sender_str, recipient, float(amount_raw) / (10**TOKEN_DECIMALS))
-
-    def _analyze_freeze_thaw(self, signature: Signature, tx, block_time: int | None):
-        for instruction in tx.transaction.message.instructions:
-            parsed = getattr(instruction, 'parsed', None)
-            instr_type = parsed.get('type') if isinstance(parsed, dict) else getattr(parsed, 'type', None)
-            if instr_type not in ['freezeAccount', 'thawAccount']: continue
-
-            info = parsed.get('info') if isinstance(parsed, dict) else getattr(parsed, 'info', None)
-            if not info or str(info.get('mint') if isinstance(info, dict) else getattr(info, 'mint', '')) != str(self.mint_pubkey): continue
-
-            ata_address = info.get('account') if isinstance(info, dict) else str(getattr(info, 'account', ''))
-            owner_address = None
-            try:
-                info_resp = self.client.get_account_info_json_parsed(Pubkey.from_string(ata_address))
-                if info_resp.value and info_resp.value.data:
-                    owner_address = info_resp.value.data.parsed['info']['owner']
-            except Exception as e: main_logger.error(f"-> RPC-Lookup für Owner von {ata_address} fehlgeschlagen: {e}")
-
-            if not owner_address:
-                main_logger.warning(f"-> Konnte Owner für {ata_address} in TX {signature} nicht ermitteln.")
-                continue
-
-            status = 'ACCOUNT_FROZEN' if instr_type == 'freezeAccount' else 'ACCOUNT_THAWED'
-            main_logger.info(f"-> Aktion '{status}' in TX {signature} für Wallet {owner_address} entdeckt.")
-            log_params = {'frozen_wallet': owner_address} if status == 'ACCOUNT_FROZEN' else {'thawed_wallet': owner_address}
-            self._log_event(str(signature), status, block_time, **log_params)
-
-    def _perform_supply_validation(self, monitored_wallets: set):
-        main_logger.info("--- Starte optionalen Validierungs-Check der Token-Menge ---")
-        
-        total_distributed = 0
-        payer_address = str(self.payer_keypair.pubkey())
-        if os.path.exists(TRANSACTION_LOG_FILE):
-            with open(TRANSACTION_LOG_FILE, 'r') as f:
-                for line in f:
-                    try:
-                        log = json.loads(line)
-                        if log.get('status') in ['VIOLATION', 'AUTHORIZED_TRANSFER'] and log.get('sender') == payer_address:
-                            total_distributed += log.get('amount', 0)
-                    except json.JSONDecodeError:
-                        continue
-        main_logger.info(f"[VALIDATION] Laut Log-Datei wurden {total_distributed:.4f} Tokens vom Payer verteilt.")
-
-        total_on_chain_balance = 0
-        payer_on_chain_balance = 0
-        wallets_with_balance = 0
-        main_logger.info(f"[VALIDATION] Frage On-Chain-Bestände für {len(monitored_wallets)} überwachte Wallets ab...")
-
-        for i, wallet_str in enumerate(sorted(list(monitored_wallets))):
-            try:
-                if self.debug_mode or (i % 10 == 0):
-                    main_logger.info(f"[VALIDATION] Frage Bestand ab für Wallet {i+1}/{len(monitored_wallets)}...")
-                
-                current_balance = self.get_token_balance(wallet_str)
-                if current_balance is not None:
-                    total_on_chain_balance += current_balance
-                    if current_balance > 0:
-                        wallets_with_balance += 1
-                
-                if wallet_str == payer_address:
-                    payer_on_chain_balance = current_balance if current_balance is not None else 0
-                time.sleep(0.1)
+                path = os.path.join(folder_path, filename)
+                keypairs.append(load_keypair_from_path(path))
             except Exception as e:
-                main_logger.error(f"[VALIDATION] Fehler beim Abrufen des Saldos für {wallet_str}: {e}")
+                logger.error(f"Konnte {filename} nicht laden ({e}), wird übersprungen.")
+    return keypairs
 
-        main_logger.info(f"[VALIDATION] {wallets_with_balance} von {len(monitored_wallets)} Wallets halten Tokens.")
-        main_logger.info(f"[VALIDATION] Summe der On-Chain-Bestände: {total_on_chain_balance:.4f} Tokens.")
-        main_logger.info(f"[VALIDATION] Davon liegen {payer_on_chain_balance:.4f} Tokens noch im Payer-Wallet.")
+def create_and_save_keypair(layer: int) -> Keypair:
+    kp = Keypair()
+    layer_folder = os.path.join(GENERATED_WALLET_FOLDER, f"layer_{layer}")
+    os.makedirs(layer_folder, exist_ok=True)
+    
+    filepath = os.path.join(layer_folder, f"{kp.pubkey()}.json")
+    with open(filepath, 'w') as f:
+        secret_bytes = kp.to_bytes()
+        b64_secret = base64.b64encode(secret_bytes)
+        b64_string = b64_secret.decode('ascii')
+        json.dump(b64_string, f)
         
-        circulating_supply = total_on_chain_balance - payer_on_chain_balance
-        main_logger.info(f"[VALIDATION] Effektiver Token-Umlauf (ohne Payer): {circulating_supply:.4f} Tokens.")
+    logger.info(f"Neues Wallet erstellt und gespeichert: {kp.pubkey()} in '{layer_folder}'")
+    return kp
 
-        discrepancy = abs(total_distributed - circulating_supply)
-        if discrepancy < 1e-4:
-            main_logger.info(f"✅ [VALIDATION] ERFOLGREICH: Die verteilte Menge stimmt mit dem effektiven Umlauf überein.")
-        else:
-            main_logger.error(f"❌ [VALIDATION] FEHLGESCHLAGEN: Diskrepanz von {discrepancy:.4f} Tokens entdeckt!")
-        main_logger.info("--- Validierungs-Check abgeschlossen ---")
+def get_token_balance(client: Client, owner_pubkey: Pubkey, mint_pubkey: Pubkey) -> Optional[float]:
+    ata = get_associated_token_address(owner_pubkey, mint_pubkey)
+    for attempt in range(4): 
+        try:
+            balance_resp = client.get_token_account_balance(ata, commitment=Commitment("confirmed"))
+            if balance_resp.value.ui_amount is None:
+                return 0.0
+            return balance_resp.value.ui_amount
+        except RPCException as e:
+            if "Invalid param: could not find account" in str(e):
+                if attempt < 3: 
+                    logger.warning(f"Versuch {attempt + 1}: Token-Konto {truncate_address(str(ata))} noch nicht gefunden. Warte 5 Sekunden...")
+                    time.sleep(5)
+                else: 
+                    logger.error(f"Konnte Token-Konto {truncate_address(str(ata))} nach mehreren Versuchen nicht finden.")
+                    return 0.0 
+            else: 
+                logger.error(f"Unerwarteter RPC-Fehler bei get_token_balance für {truncate_address(str(ata))} (Versuch {attempt+1}): {e}")
+                if attempt == 3: 
+                    raise e 
+                time.sleep(5) 
+    return 0.0 
 
-    def _log_event(self, signature: str, status: str, block_time: int | None, **kwargs):
-        ts = datetime.utcfromtimestamp(block_time).isoformat() + "Z" if block_time else datetime.utcnow().isoformat() + "Z"
-        log_entry = {'timestamp': ts, 'signature': signature, 'status': status, **kwargs}
-        transaction_logger.info(json.dumps(log_entry))
+def fund_with_sol(client: Client, payer: Keypair, recipient_pubkey: Pubkey, sol_amount: float = 0.003) -> str:
+    lamports = int(sol_amount * 1_000_000_000)
+    
+    instruction = transfer(
+        TransferParams(
+            from_pubkey=payer.pubkey(),
+            to_pubkey=recipient_pubkey,
+            lamports=lamports
+        )
+    )
+    
+    latest_blockhash_resp = client.get_latest_blockhash()
+    transaction = Transaction.new_signed_with_payer(
+        [instruction],
+        payer.pubkey(),
+        [payer],
+        latest_blockhash_resp.value.blockhash
+    )
+    
+    tx_opts = TxOpts(skip_confirmation=False, preflight_commitment=Commitment("confirmed"))
+    resp = client.send_transaction(transaction, opts=tx_opts)
+    signature = resp.value
+    client.confirm_transaction(signature, commitment=Commitment("confirmed"))
+    
+    logger.info(f"Wallet {truncate_address(str(recipient_pubkey))} mit {sol_amount} SOL aufgeladen. Signatur: {signature}")
+    return str(signature)
 
-    def run_check(self):
-        main_logger.info(f"{'='*50}\nStarte Prüfungslauf um {datetime.now():%Y-%m-%d %H:%M:%S}")
-        self.whitelist, self.greylist, state = load_whitelist(), load_greylist(), load_state()
-        if not self.whitelist:
-            main_logger.warning("Whitelist leer. Prüfung übersprungen.")
+def send_token_transfer(client: Client, payer: Keypair, sender: Keypair, recipient_pubkey: Pubkey, mint_pubkey: Pubkey, amount_raw: int, decimals: int) -> str:
+    if amount_raw <= 0:
+        logger.warning("Transfermenge ist Null oder negativ. Überspringe.")
+        return ""
+
+    sender_ata = get_associated_token_address(sender.pubkey(), mint_pubkey)
+    recipient_ata = get_associated_token_address(recipient_pubkey, mint_pubkey)
+    
+    instructions = []
+    
+    recipient_account_info_value = None
+    max_retries = 4
+    retry_delay = 7 
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Versuch {attempt + 1}/{max_retries}: Rufe Kontoinformationen für ATA {truncate_address(str(recipient_ata))} ab...")
+            # MODIFIED for solana==0.36.6: Pass commitment directly
+            resp = client.get_account_info(recipient_ata, commitment=Commitment("confirmed"))
+            recipient_account_info_value = resp.value
+            logger.info(f"Kontoinformationen für ATA {truncate_address(str(recipient_ata))} erfolgreich abgerufen (Versuch {attempt + 1}).")
+            break 
+        except SolanaRpcException as e:
+            error_message = f"SolanaRpcException bei Versuch {attempt + 1}/{max_retries} für ATA {truncate_address(str(recipient_ata))}: {str(e)[:200]}."
+            if "Invalid param: TokenAccount not found" in str(e) or "could not find account" in str(e): # More specific checks for non-existent account
+                logger.info(f"ATA {truncate_address(str(recipient_ata))} existiert nicht (Versuch {attempt+1}). Wird erstellt.")
+                break # Exit retry loop, account will be created
+            elif attempt < max_retries - 1:
+                logger.warning(f"{error_message} Wiederholung in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"{error_message} Alle Wiederholungen fehlgeschlagen.")
+                raise 
+        except Exception as e: 
+            error_message = f"Unerwarteter Fehler bei Versuch {attempt + 1}/{max_retries} für ATA {truncate_address(str(recipient_ata))}: {e}."
+            if attempt < max_retries - 1:
+                logger.warning(f"{error_message} Wiederholung in {retry_delay}s...", exc_info=False)
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"{error_message} Alle Wiederholungen fehlgeschlagen.", exc_info=True)
+                raise
+
+    # If recipient_account_info_value is still None (e.g., after "TokenAccount not found" or if retries failed but didn't raise)
+    # or if it's an account object that signifies it's empty/uninitialized (depends on exact return of older solana-py)
+    # A robust check is if recipient_account_info_value is None, or if it is an Account object whose `data` field is empty or indicates no SPL token account.
+    # For simplicity, if it's None, we assume it needs creation.
+    if not recipient_account_info_value: 
+        logger.info(f"Token-Konto (ATA) {truncate_address(str(recipient_ata))} für Empfänger {truncate_address(str(recipient_pubkey))} existiert nicht oder konnte nicht verifiziert werden. Erstelle es...")
+        instructions.append(
+            create_associated_token_account(
+                payer=sender.pubkey(), 
+                owner=recipient_pubkey,
+                mint=mint_pubkey
+            )
+        )
+
+    instructions.append(
+        transfer_checked(
+            TransferCheckedParams(
+                program_id=TOKEN_PROGRAM_ID,
+                source=sender_ata,
+                mint=mint_pubkey,
+                dest=recipient_ata,
+                owner=sender.pubkey(),
+                amount=amount_raw,
+                decimals=decimals,
+                signers=[] 
+            )
+        )
+    )
+    
+    latest_blockhash_resp = client.get_latest_blockhash()
+    transaction = Transaction.new_signed_with_payer(
+        instructions,
+        payer.pubkey(), 
+        [payer, sender], 
+        latest_blockhash_resp.value.blockhash
+    )
+    
+    tx_opts = TxOpts(skip_confirmation=False, preflight_commitment=Commitment("confirmed"))
+    resp = client.send_transaction(transaction, opts=tx_opts)
+    signature = resp.value
+    client.confirm_transaction(signature, commitment=Commitment("confirmed"))
+    
+    return str(signature)
+
+# --- Hauptlogik --- (run_standard_mode and run_outside_mode remain largely the same, minor logging adjustments for decimals)
+def run_standard_mode(client, payer_keypair, mint_pubkey, decimals, wallets, min_amount, max_amount):
+    if len(wallets) < 2:
+        logger.warning(f"Nicht genügend Wallets ({len(wallets)}) im Pool für einen Transfer.")
+        return
+
+    logger.info(f"Führe Transaktion innerhalb des Netzwerks mit {len(wallets)} Wallets durch...")
+
+    sender_kp = random.choice(wallets)
+    possible_recipients = [w for w in wallets if w.pubkey() != sender_kp.pubkey()]
+    if not possible_recipients:
+        logger.warning(f"Kein gültiger Empfänger für Sender {truncate_address(str(sender_kp.pubkey()))} gefunden.")
+        return
+    recipient_kp = random.choice(possible_recipients)
+    
+    sender_balance = get_token_balance(client, sender_kp.pubkey(), mint_pubkey)
+
+    if sender_balance is None or sender_balance <= 0:
+        logger.warning(f"Sender {truncate_address(str(sender_kp.pubkey()))} hat keinen positiven Kontostand ({sender_balance if sender_balance is not None else 'Fehler'}). Überspringe.")
+        return
+
+    actual_max_amount = min(max_amount, sender_balance)
+    if actual_max_amount < min_amount:
+        # Use f-string formatting for decimals if decimals > 0
+        balance_str = f"{sender_balance:.{decimals}f}" if decimals > 0 else str(int(sender_balance))
+        min_amount_str = f"{min_amount:.{decimals}f}" if decimals > 0 else str(int(min_amount))
+        logger.warning(f"Sender {truncate_address(str(sender_kp.pubkey()))} hat nicht genug Guthaben ({balance_str}) für Mindestüberweisung ({min_amount_str}).")
+        return
+    
+    random_amount = random.uniform(min_amount, actual_max_amount)
+    random_amount_raw = int(random_amount * (10**decimals))
+
+    amount_str = f"{random_amount:.{decimals}f}" if decimals > 0 else str(int(random_amount))
+    logger.info(f"NETZWERK-HANDEL: Sende {amount_str} Tokens von {truncate_address(str(sender_kp.pubkey()))} an {truncate_address(str(recipient_kp.pubkey()))}...")
+
+    try:
+        sol_balance_resp = client.get_balance(sender_kp.pubkey(), commitment=Commitment("confirmed"))
+        if sol_balance_resp.value < 5000: 
+             logger.info(f"Lade Sender-Wallet {truncate_address(str(sender_kp.pubkey()))} mit SOL auf (aktuell: {sol_balance_resp.value} Lamports).")
+             fund_with_sol(client, payer_keypair, sender_kp.pubkey()) 
+             time.sleep(10)
+
+        signature = send_token_transfer(client, payer_keypair, sender_kp, recipient_kp.pubkey(), mint_pubkey, random_amount_raw, decimals)
+        if signature:
+            logger.info(f"✅ ERFOLG! Transaktion im Netzwerk gesendet. Signatur: {signature}")
+    except Exception as e:
+        logger.error(f"Fehler bei Netzwerk-Transfer von {truncate_address(str(sender_kp.pubkey()))} zu {truncate_address(str(recipient_kp.pubkey()))}: {e}", exc_info=True)
+
+def run_outside_mode(client, payer_keypair, mint_pubkey, decimals, initial_wallets, args, outside_network_wallets):
+    if outside_network_wallets and len(outside_network_wallets) >= 2 and random.random() > 0.3:
+        logger.info(f"Führe Standard-Modus innerhalb des 'outside_network_wallets' Pools ({len(outside_network_wallets)} Wallets) durch.")
+        run_standard_mode(client, payer_keypair, mint_pubkey, decimals, outside_network_wallets, args.min, args.max)
+        return
+
+    logger.info(f"Starte neuen Outside-Durchlauf: {args.outside} Hops und dann Verzweigung.")
+    
+    if not initial_wallets:
+        logger.error("OUTSIDE: Keine initialen Wallets zum Starten des Outside-Modus vorhanden.")
+        return
+        
+    sender_kp = random.choice(initial_wallets)
+    sender_balance = get_token_balance(client, sender_kp.pubkey(), mint_pubkey)
+    
+    sender_balance_str = f"{sender_balance or 0.0:.{decimals}f}" if decimals > 0 else str(int(sender_balance or 0.0))
+    min_amount_str = f"{args.min:.{decimals}f}" if decimals > 0 else str(int(args.min))
+
+    if sender_balance is None or sender_balance < args.min:
+        logger.warning(f"OUTSIDE: Initialer Sender {truncate_address(str(sender_kp.pubkey()))} hat nicht genug Guthaben ({sender_balance_str} < {min_amount_str}). Überspringe Runde.")
+        return
+
+    min_transfer_fraction = 0.5 
+    max_transfer_fraction = 0.9 
+    transfer_fraction = random.uniform(min_transfer_fraction, max_transfer_fraction)
+    
+    transfer_amount = max(args.min, sender_balance * transfer_fraction)
+    transfer_amount = min(transfer_amount, sender_balance) 
+
+    if transfer_amount < args.min : 
+        transfer_amount_str = f"{transfer_amount:.{decimals}f}" if decimals > 0 else str(int(transfer_amount))
+        logger.warning(f"OUTSIDE: Berechnete Transfermenge {transfer_amount_str} für {truncate_address(str(sender_kp.pubkey()))} ist unter Minimum {min_amount_str}. Überspringe.")
+        return
+
+    transfer_amount_raw = int(transfer_amount * (10**decimals))
+    
+    current_sender_kp = sender_kp
+    
+    try:
+        for i in range(1, args.outside + 1):
+            hop_num = i
+            logger.info(f"--- Hop {hop_num}/{args.outside} ---")
+            
+            new_recipient_kp = create_and_save_keypair(layer=hop_num)
+            fund_with_sol(client, payer_keypair, new_recipient_kp.pubkey(), sol_amount=0.005) 
+            time.sleep(10) 
+            
+            current_amount_str = f"{transfer_amount:.{decimals}f}" if decimals > 0 else str(int(transfer_amount))
+            logger.info(f"OUTSIDE Hop {hop_num-1} ({truncate_address(str(current_sender_kp.pubkey()))}) -> Hop {hop_num} ({truncate_address(str(new_recipient_kp.pubkey()))}): Sende {current_amount_str} Tokens...")
+            
+            signature = send_token_transfer(client, payer_keypair, current_sender_kp, new_recipient_kp.pubkey(), mint_pubkey, transfer_amount_raw, decimals)
+            logger.info(f"✅ HOP {hop_num} ERFOLGREICH! Signatur: {signature}")
+
+            current_sender_kp = new_recipient_kp 
+            time.sleep(args.delay if args.delay > 5 else 7) 
+
+        distributor_kp = current_sender_kp
+        logger.info(f"Alle {args.outside} Hops abgeschlossen. Verteiler-Wallet: {truncate_address(str(distributor_kp.pubkey()))}")
+        logger.info("Starte Verzweigungsphase...")
+
+        distributor_balance = get_token_balance(client, distributor_kp.pubkey(), mint_pubkey)
+        dist_balance_str = f"{distributor_balance or 0.0:.{decimals}f}" if decimals > 0 else str(int(distributor_balance or 0.0))
+        if distributor_balance is None or distributor_balance <= 0.000001: 
+            logger.error(f"Verteiler-Wallet {truncate_address(str(distributor_kp.pubkey()))} hat kein Guthaben ({dist_balance_str}) für die Verzweigung.")
             return
 
-        wallets_scanned_in_run, signatures_found_in_run, signatures_processed_in_run = set(), {}, set()
-        pass_num = 1
-        while True:
-            main_logger.info(f"--- Starte Analyse-Pass #{pass_num} ---")
-            monitored_now = self.whitelist.union(self.greylist)
-            wallets_to_scan = monitored_now - wallets_scanned_in_run
-            if not wallets_to_scan:
-                main_logger.info("Keine neuen Wallets zum Scannen. Kette vollständig analysiert.")
-                break
-
-            main_logger.info(f"Scanne {len(wallets_to_scan)} Wallet(s) in diesem Pass.")
-            for wallet in sorted(list(wallets_to_scan)):
-                state_entry = state.get(wallet, {})
-                last_sig = state_entry.get('last_sig') if isinstance(state_entry, dict) else state_entry
-                
-                if wallet in self.greylist and isinstance(state_entry, dict) and "last_balance" in state_entry:
-                    last_bal = state_entry.get("last_balance")
-                    current_bal = self.get_token_balance(wallet)
-                    if current_bal is not None and abs(current_bal - last_bal) < 1e-9:
-                        main_logger.debug(f"-> Kontostand für {truncate_address(wallet)} gleich. Führe Sicherheits-Check der Signatur durch...")
-                        try:
-                            sig_resp = self.client.get_signatures_for_address(Pubkey.from_string(wallet), limit=1)
-                            latest_sig_on_chain = str(sig_resp.value[0].signature) if sig_resp.value else None
-                            if latest_sig_on_chain == last_sig or (latest_sig_on_chain is None and last_sig is None):
-                                main_logger.info(f"-> Signatur unverändert. Überspringe Tiefenanalyse für {truncate_address(wallet)}.")
-                                wallets_scanned_in_run.add(wallet)
-                                continue
-                            else:
-                                main_logger.warning(f"-> Kontostand gleich, aber neue Signatur gefunden! Erzwinge Tiefenanalyse für {truncate_address(wallet)}.")
-                        except Exception as e:
-                            main_logger.error(f"-> Fehler bei Sicherheits-Check für {wallet}: {e}. Erzwinge Tiefenanalyse.")
-                
-                main_logger.debug(f"Führe Tiefenanalyse für Wallet aus: {wallet}")
-                new_sigs = self.get_new_signatures_paginated(wallet, last_sig)
-                if new_sigs:
-                    main_logger.info(f"-> {len(new_sigs)} neue Transaktion(en) für {wallet} gefunden.")
-                    for s in new_sigs: signatures_found_in_run[s.signature] = s
-                    if not isinstance(state.get(wallet), dict): state[wallet] = {}
-                    state[wallet]['last_sig'] = str(new_sigs[-1].signature)
-                wallets_scanned_in_run.add(wallet)
-
-            new_signatures_to_process = set(signatures_found_in_run.keys()) - signatures_processed_in_run
-            if not new_signatures_to_process:
-                main_logger.info("Keine neuen Transaktionen in diesem Pass zu analysieren.")
-                if pass_num > 1: break 
-                pass_num += 1; continue
-            
-            main_logger.info(f"Analysiere {len(new_signatures_to_process)} neue, einzigartige Transaktionen...")
-            initial_greylist_size = len(self.greylist)
-            sorted_sigs = sorted([signatures_found_in_run[s] for s in new_signatures_to_process], key=lambda si: si.block_time or 0)
-            
-            total_tx = len(sorted_sigs)
-            for i, sig_info in enumerate(sorted_sigs):
-                if not self.debug_mode:
-                    progress = (i + 1) / total_tx
-                    bar = '█' * int(40 * progress) + '-' * (40 - int(40 * progress))
-                    sys.stdout.write(f'\rPass #{pass_num} Fortschritt: [{bar}] {i+1}/{total_tx} ({progress:.0%})')
-                    sys.stdout.flush()
-                main_logger.debug(f"Analysiere TX {i+1}/{len(sorted_sigs)}: {sig_info.signature}")
-                self.analyze_transaction(sig_info.signature, sig_info.block_time, monitored_now, state)
-                signatures_processed_in_run.add(sig_info.signature)
-            
-            if not self.debug_mode: sys.stdout.write('\n')
-            if len(self.greylist) == initial_greylist_size:
-                main_logger.info("Keine neuen Greylist-Wallets entdeckt. Beende den Prüfungslauf.")
-                break
-            pass_num += 1
-
-        main_logger.info("Alle Pässe abgeschlossen. Aktualisiere finale Kontostände im Status...")
-        final_monitored = self.whitelist.union(self.greylist)
-        for wallet in sorted(list(final_monitored)):
-            balance = self.get_token_balance(wallet)
-            if balance is not None:
-                if not isinstance(state.get(wallet), dict):
-                    state[wallet] = {'last_sig': state.get(wallet), 'last_balance': None}
-                state[wallet]['last_balance'] = balance
+        network_size = args.network_size if args.network_size > 0 else random.randint(2, 4)
+        if network_size <= 0: network_size = 1 
         
-        save_state(state)
-        save_greylist(self.greylist)
-        visualizer = NetworkVisualizer(TRANSACTION_LOG_FILE, self.whitelist, self.greylist, str(self.payer_keypair.pubkey()))
-        visualizer.generate_graph()
-        if self.perform_validation: self._perform_supply_validation(final_monitored)
-        main_logger.info("Prüfungslauf abgeschlossen.")
+        sol_per_branch_ata_creation = 0.0021 
+        funding_amount_sol = network_size * sol_per_branch_ata_creation
+        logger.info(f"Lade Verteiler-Wallet {truncate_address(str(distributor_kp.pubkey()))} für {network_size} Zweige mit {funding_amount_sol:.4f} SOL auf...")
+        fund_with_sol(client, payer_keypair, distributor_kp.pubkey(), sol_amount=funding_amount_sol)
+        time.sleep(10) 
+
+        amount_per_branch = distributor_balance / network_size
+        amount_per_branch_str = f"{amount_per_branch:.{decimals}f}" if decimals > 0 else str(int(amount_per_branch))
+        
+        # Compare amount_per_branch with args.min, not args.min / (10**decimals)
+        if amount_per_branch < args.min and amount_per_branch > 0: 
+             logger.warning(f"Betrag pro Zweig ({amount_per_branch_str}) ist sehr klein im Vergleich zum Minimum von {args.min}. Erwägen Sie eine Reduzierung der Netzwerkgröße oder mehr Token im Verteiler.")
+        
+        amount_per_branch_raw = int(amount_per_branch * (10**decimals))
+        if amount_per_branch_raw <= 0:
+            logger.error(f"Verteiler-Wallet {truncate_address(str(distributor_kp.pubkey()))} hat nicht genug Token ({dist_balance_str}) für {network_size} Zweige. Betrag pro Zweig wäre <= 0.")
+            return
+
+        trading_layer = args.outside + 1 
+        newly_created_wallets_for_pool = []
+
+        for i in range(network_size):
+            logger.info(f"Erstelle Zweig {i+1}/{network_size}...")
+            branch_wallet_kp = create_and_save_keypair(layer=trading_layer)
+            
+            branch_amount_str = f"{amount_per_branch:.{decimals}f}" if decimals > 0 else str(int(amount_per_branch))
+            logger.info(f"Überweise {branch_amount_str} Tokens an Zweig {i+1} ({truncate_address(str(branch_wallet_kp.pubkey()))})...")
+            signature = send_token_transfer(client, payer_keypair, distributor_kp, branch_wallet_kp.pubkey(), mint_pubkey, amount_per_branch_raw, decimals)
+            
+            if signature:
+                logger.info(f"✅ Zweig {i+1} erfolgreich erstellt. Signatur: {signature}")
+                newly_created_wallets_for_pool.append(branch_wallet_kp)
+                fund_with_sol(client, payer_keypair, branch_wallet_kp.pubkey(), sol_amount=0.003) 
+                time.sleep(args.delay if args.delay > 5 else 7) 
+            else:
+                logger.error(f"Fehler bei der Erstellung von Zweig {i+1} (Token-Transfer fehlgeschlagen).")
+
+        outside_network_wallets.extend(newly_created_wallets_for_pool)
+        logger.info(f"{len(newly_created_wallets_for_pool)} neue Wallets zum externen Handelspool hinzugefügt.")
+
+    except Exception as e:
+        logger.error(f"Fehler während des Outside-Modus: {e}", exc_info=True)
+
+# ... (alle imports und Funktionen bis main) ...
+
+def main(args):
+    try:
+        payer_path = os.path.join(CONFIG_WALLET_FOLDER, "payer-wallet.json")
+        mint_path = os.path.join(CONFIG_WALLET_FOLDER, "mint-wallet.json")
+        
+        if not os.path.exists(payer_path) or not os.path.exists(mint_path):
+             logger.error(f"Kritischer Fehler: 'payer-wallet.json' oder 'mint-wallet.json' nicht im Ordner '{CONFIG_WALLET_FOLDER}' gefunden.")
+             sys.exit(1)
+
+        payer_keypair = load_keypair_from_path(payer_path)
+        mint_pubkey = load_keypair_from_path(mint_path).pubkey()
+        initial_wallets = load_all_keypairs(WALLET_SOURCE_FOLDER)
+        initial_wallets = [w for w in initial_wallets if w.pubkey() not in [payer_keypair.pubkey(), mint_pubkey]]
+    except Exception as e:
+        logger.error(f"Kritischer Fehler beim Laden der Start-Wallets: {e}", exc_info=True)
+        sys.exit(1)
+
+    if not initial_wallets:
+        logger.error(f"Keine operativen Wallets im '{WALLET_SOURCE_FOLDER}'-Ordner gefunden (nach Filterung von Payer/Mint).")
+        sys.exit(1)
+
+    # MODIFIED for solana==0.36.6:
+    # Initialize Client without httpx_client_kwargs or a direct timeout in constructor
+    logger.info(f"Initialisiere RPC Client für {RPC_URL} (solana-py 0.36.6 verwendet Standard-HTTP-Timeouts)")
+    client = Client(RPC_URL) 
+    
+    decimals = 0 # Default, will be updated
+    try:
+        # Fetch token info once
+        token_supply_resp = client.get_token_supply(mint_pubkey, commitment=Commitment("confirmed"))
+        decimals = token_supply_resp.value.decimals
+    except Exception as e:
+        logger.error(f"Konnte Token-Informationen für Mint {mint_pubkey} nicht abrufen: {e}", exc_info=True)
+        logger.error("Konnte Dezimalstellen nicht ermitteln. Das Skript kann nicht fortfahren.")
+        sys.exit(1)
+
+
+    logger.info(f"{len(initial_wallets)} initiale Wallets geladen. Starte Traffic-Generierung...")
+    logger.info(f"Payer: {payer_keypair.pubkey()}")
+    logger.info(f"Token Mint: {mint_pubkey} (Dezimalstellen: {decimals})")
+
+    if args.outside > 0:
+        logger.info(f"Modus: --outside aktiviert mit {args.outside} Hops.")
+        if args.network_size > 0: 
+            logger.info(f"Netzwerkgröße pro Verzweigung: {args.network_size}")
+        else: 
+            logger.info(f"Netzwerkgröße pro Verzweigung: zufällig (2-4)")
+    
+    outside_network_wallets = [] 
+    if args.outside > 0:
+        trading_layer = args.outside + 1
+        trading_network_folder = os.path.join(GENERATED_WALLET_FOLDER, f"layer_{trading_layer}")
+        if os.path.exists(trading_network_folder):
+            logger.info(f"Lade existierende Wallets aus dem Handelsnetzwerk-Ordner: '{trading_network_folder}'")
+            loaded_trading_wallets = load_all_keypairs(trading_network_folder)
+            
+            verified_wallets = []
+            if loaded_trading_wallets:
+                logger.info(f"{len(loaded_trading_wallets)} potenzielle Wallets aus '{trading_network_folder}' geladen. Überprüfe Guthaben...")
+                for wallet_kp in loaded_trading_wallets:
+                    try:
+                        sol_bal = client.get_balance(wallet_kp.pubkey(), commitment=Commitment("confirmed")).value
+                        token_bal = get_token_balance(client, wallet_kp.pubkey(), mint_pubkey)
+                        
+                        token_bal_str = f"{token_bal:.{decimals}f}" if decimals > 0 and token_bal is not None else str(int(token_bal or 0))
+
+                        if token_bal is not None and token_bal > 0 and sol_bal > 10000: 
+                            logger.info(f"Aktives Wallet {truncate_address(str(wallet_kp.pubkey()))} mit {token_bal_str} Tokens und {sol_bal} Lamports gefunden.")
+                            verified_wallets.append(wallet_kp)
+                        else:
+                            logger.debug(f"Wallet {truncate_address(str(wallet_kp.pubkey()))} hat unzureichendes Guthaben (Tokens: {token_bal_str}, SOL: {sol_bal}).")
+                    except Exception as e:
+                        logger.warning(f"Fehler beim Überprüfen von Wallet {truncate_address(str(wallet_kp.pubkey()))}: {e}. Wird ignoriert.")
+            
+            outside_network_wallets = verified_wallets
+            if outside_network_wallets:
+                 logger.info(f"{len(outside_network_wallets)} aktive Wallets im Handelsnetzwerk initialisiert.")
+            else:
+                 logger.info("Keine aktiven Wallets im bestehenden Handelsnetzwerk gefunden.")
+
+    loop_count = 0
+    while True:
+        loop_count += 1
+        logger.info(f"--- Starte Aktionszyklus {loop_count} ---")
+        try:
+            if args.outside > 0:
+                run_outside_mode(client, payer_keypair, mint_pubkey, decimals, initial_wallets, args, outside_network_wallets)
+            else: 
+                if len(initial_wallets) < 2:
+                    logger.error("Für den Standardmodus werden mindestens 2 Wallets im Quellordner benötigt.")
+                    break 
+                run_standard_mode(client, payer_keypair, mint_pubkey, decimals, initial_wallets, args.min, args.max)
+            
+            logger.info(f"Aktionszyklus {loop_count} beendet. Warte {args.delay} Sekunden bis zur nächsten Aktion...")
+            time.sleep(args.delay)
+
+        except KeyboardInterrupt:
+            logger.info("Skript wird durch Benutzer beendet.")
+            sys.exit(0)
+        except SolanaRpcException as e: 
+            # Check if the error message indicates a timeout, which is more likely without explicit timeout control
+            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                logger.error(f"Solana RPC Timeout im Hauptzyklus: {e}", exc_info=False) # exc_info=False for cleaner timeout log
+                logger.info("RPC Timeout. Warte 90 Sekunden und versuche es erneut...")
+                time.sleep(90) # Longer wait for timeouts
+            else:
+                logger.error(f"Solana RPC Fehler im Hauptzyklus: {e}", exc_info=True)
+                logger.info("Warte 60 Sekunden und versuche es erneut...")
+                time.sleep(60)
+        except Exception as e: 
+            logger.error(f"Ein unerwarteter Hauptfehler ist aufgetreten: {e}", exc_info=True)
+            logger.info("Warte 30 Sekunden und versuche es erneut...")
+            time.sleep(30)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Periodischer Solana Whitelist/Greylist-Prüfer.")
-    parser.add_argument("--debug", action="store_true", help="Aktiviert detaillierte Debug-Ausgaben.")
-    parser.add_argument("--interval", type=int, default=15, help="Prüfungsintervall in Minuten (Standard: 15).")
-    parser.add_argument("--freezesend", action="store_true", help="Friert den Sender bei einem Verstoß ein.")
-    parser.add_argument("--freezereceive", action="store_true", help="Friert den Empfänger bei einem Verstoß ein.")
-    parser.add_argument("--validate", action="store_true", help="Aktiviert optionalen On-Chain Validierungs-Check.")
+    parser = argparse.ArgumentParser(description="Solana Advanced Traffic Generator.")
+    parser.add_argument("--delay", type=int, default=7, help="Verzögerung in Sekunden zwischen den Aktionen (Standard: 7).")
+    parser.add_argument("--min", type=float, default=1.0, help="Mindestmenge an Tokens pro Transfer (Standard: 1.0).")
+    parser.add_argument("--max", type=float, default=100.0, help="Höchstmenge an Tokens pro Transfer (Standard: 100.0).")
+    parser.add_argument("--outside", type=int, default=0, help="Aktiviert den 'Outside'-Modus. Gibt die Anzahl der Hops an (0 deaktiviert).")
+    parser.add_argument("--network-size", type=int, default=0, help="Feste Anzahl der Wallets im neuen Handelsnetzwerk nach Verzweigung. (Standard: zufällig 2-4, wenn 0 angegeben)")
+    
     args = parser.parse_args()
 
-    main_logger = setup_logger('main_checker', MAIN_LOG_FILE, debug_mode=args.debug)
-    os.makedirs(ANALYSE_FOLDER, exist_ok=True)
-    checker = PeriodicChecker(debug_mode=args.debug, freeze_sender=args.freezesend, freeze_recipient=args.freezereceive, validate=args.validate)
-    
-    while True:
-        try:
-            checker.run_check()
-            interval = args.interval
-            print(f"\nPrüfung um {datetime.now():%H:%M:%S} abgeschlossen. Nächste Prüfung in {interval} Minuten.")
-            time.sleep(interval * 60)
-        except KeyboardInterrupt:
-            main_logger.info("\nSkript wird durch Benutzer beendet.")
-            sys.exit(0)
-        except Exception as e:
-            main_logger.critical(f"Ein kritischer Fehler in der Hauptschleife aufgetreten: {e}\n{traceback.format_exc()}")
-            main_logger.info("Warte 5 Minuten und versuche es erneut...")
-            time.sleep(300)
+    if args.min <= 0 or args.max <= 0 or args.max < args.min:
+        print("Fehler: --min und --max müssen positiv sein, und --max muss >= --min sein.")
+        sys.exit(1)
+    if args.delay < 0:
+        print("Fehler: --delay darf nicht negativ sein.")
+        sys.exit(1)
+    if args.outside < 0:
+        print("Fehler: --outside darf nicht negativ sein.")
+        sys.exit(1)
+    if args.network_size < 0:
+        print("Fehler: --network-size darf nicht negativ sein.")
+        sys.exit(1)
+        
+    main(args)
